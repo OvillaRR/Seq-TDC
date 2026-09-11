@@ -1,0 +1,3718 @@
+# ============================================================
+# 0) IMPORTS
+# ============================================================
+
+import re
+import copy
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    roc_curve
+)
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+
+pd.set_option("display.max_columns", None)
+
+
+# ============================================================
+# 1) CARGA DE DATOS
+# ============================================================
+
+# BASE TRANSACCIONAL
+log_aut = pd.read_sas(
+    r'\2\Collections Unsecured\TDC\ANALISIS',
+    encoding='latin1'
+)
+
+# BASE CARTERA / FOTOGRAFÍA MENSUAL
+cartera = pd.read_sas(
+    r'\ollections Unsecured\TDC\ANALISIS',
+    encoding='latin1'
+)
+
+
+# ============================================================
+# 2) CONFIGURACIÓN GENERAL
+# ============================================================
+
+@dataclass
+class Config:
+
+    # --------------------------------------------------------
+    # Máximo de transacciones que verá la LSTM por corte
+    # --------------------------------------------------------
+    max_seq_len: int = 100
+
+    # --------------------------------------------------------
+    # Mínimo de transacciones necesarias para crear muestra
+    # --------------------------------------------------------
+    min_txn_history: int = 5
+
+    # --------------------------------------------------------
+    # Cardinalidad máxima aprendida en TRAIN
+    # --------------------------------------------------------
+    top_giro: int = 100
+    top_city: int = 200
+    top_merchant: int = 1000
+
+    top_giro_city: int = 1000
+    top_giro_amount_bin: int = 500
+
+    # --------------------------------------------------------
+    # Bins de MAGNITUD de monto
+    #
+    # Ya no mezclamos:
+    #   -500
+    #   +500
+    #
+    # El signo será una variable independiente.
+    # --------------------------------------------------------
+    amount_bins: Tuple[float, ...] = (
+        0,
+        50,
+        200,
+        500,
+        1000,
+        3000,
+        10000,
+        np.inf
+    )
+
+
+CFG = Config()
+
+
+# ============================================================
+# VARIABLES QUE VA A VER EL MODELO
+# ============================================================
+
+SEQ_NUM_COLS = [
+
+    "amount_abs_log",
+    "amount_sign",
+
+    "delta_days",
+
+    "day_of_week",
+    "is_weekend",
+
+    "days_to_asof"
+]
+
+
+CAT_SEQ_COLS = [
+
+    "giro_r",
+    "merchant_r",
+    "city_r",
+
+    "giro_city_r",
+    "giro_amount_bin_r"
+]
+
+
+STATIC_FEATURE_NAMES = [
+
+    "nbalancee",
+    "account_age_days",
+    "first_use_age_days",
+    "UTILL"
+]
+
+
+# ============================================================
+# 3) UTILIDADES DE LIMPIEZA
+# ============================================================
+
+def clean_account_id(x):
+    """
+    Limpia exclusivamente el identificador de cuenta.
+
+    MUY IMPORTANTE:
+    una cuenta faltante NO se convierte en UNKNOWN,
+    porque eso mezclaría varias cuentas inexistentes
+    como si fueran el mismo cliente.
+    """
+
+    if pd.isna(x):
+        return np.nan
+
+    # Bytes reales
+    if isinstance(x, bytes):
+
+        try:
+            x = x.decode(
+                "utf-8",
+                errors="ignore"
+            )
+        except Exception:
+            return np.nan
+
+    # --------------------------------------------------------
+    # SAS frecuentemente trae IDs numéricos como float:
+    #
+    # 123456789.0
+    #
+    # Lo convertimos:
+    #
+    # "123456789"
+    # --------------------------------------------------------
+
+    if isinstance(
+        x,
+        (
+            float,
+            np.floating
+        )
+    ):
+
+        if np.isnan(x):
+            return np.nan
+
+        if float(x).is_integer():
+            return str(int(x))
+
+    if isinstance(
+        x,
+        (
+            int,
+            np.integer
+        )
+    ):
+        return str(int(x))
+
+    x = str(x).strip()
+
+    # b'12345'
+    if re.match(
+        r"""^b["'].*["']$""",
+        x
+    ):
+        x = x[2:-1]
+
+    # Caso:
+    # "123456.0"
+    if re.match(
+        r"^\d+\.0$",
+        x
+    ):
+        x = x[:-2]
+
+    if x.upper() in {
+        "",
+        "NAN",
+        "NONE",
+        "NULL",
+        "UNKNOWN"
+    }:
+        return np.nan
+
+    return x
+
+
+def clean_bytes_string(x):
+    """
+    Limpia variables categóricas.
+
+    Aquí SÍ permitimos UNKNOWN porque:
+    merchant desconocido
+    city desconocida
+    giro desconocido
+
+    son observaciones válidas.
+    """
+
+    if pd.isna(x):
+        return "UNKNOWN"
+
+    if isinstance(x, bytes):
+
+        try:
+            x = x.decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+        except Exception:
+            x = str(x)
+
+    x = str(x).strip()
+
+    # Ejemplo:
+    # b'OXXO'
+    if re.match(
+        r"""^b["'].*["']$""",
+        x
+    ):
+        x = x[2:-1]
+
+    x = x.upper().strip()
+
+    # Varios espacios -> uno
+    x = re.sub(
+        r"\s+",
+        " ",
+        x
+    )
+
+    if x == "":
+        return "UNKNOWN"
+
+    return x
+
+
+def clean_amount(x):
+    """
+    Convierte montos a float.
+
+    Ejemplos:
+
+    $1,200.50  -> 1200.50
+    (500)      -> -500
+    """
+
+    if pd.isna(x):
+        return np.nan
+
+    s = (
+        str(x)
+        .replace(",", "")
+        .replace("$", "")
+        .strip()
+    )
+
+    # Contabilidad
+    if re.match(
+        r"^\(.*\)$",
+        s
+    ):
+
+        s = "-" + s[1:-1]
+
+    try:
+        return float(s)
+
+    except Exception:
+        return np.nan
+
+
+def build_vocab(series):
+    """
+    Construye vocabulario categórico.
+
+    Sólo debe ejecutarse con TRAIN.
+
+    0 = PAD
+    1 = UNK
+    """
+
+    vocab = {
+        "<PAD>": 0,
+        "<UNK>": 1
+    }
+
+    for value in (
+        series
+        .fillna("UNKNOWN")
+        .astype(str)
+        .unique()
+    ):
+
+        if value not in vocab:
+
+            vocab[value] = len(vocab)
+
+    return vocab
+
+
+# ============================================================
+# 4) PADDING
+# ============================================================
+
+def pad_num_sequences(
+    seqs,
+    max_len,
+    n_features
+):
+
+    """
+    Convierte secuencias de longitud variable a:
+
+        [N, max_seq_len, n_features]
+
+    IMPORTANTE:
+
+    usamos RIGHT PADDING:
+
+    trx1 trx2 trx3 PAD PAD
+
+    porque después usamos:
+
+        pack_padded_sequence()
+
+    Tu código original hacía LEFT padding:
+
+    PAD PAD trx1 trx2 trx3
+
+    y eso NO es compatible con lengths de la forma en que
+    estamos usando pack_padded_sequence.
+    """
+
+    out = np.zeros(
+
+        (
+            len(seqs),
+            max_len,
+            n_features
+        ),
+
+        dtype=np.float32
+    )
+
+    lengths = np.zeros(
+        len(seqs),
+        dtype=np.int64
+    )
+
+    for i, seq in enumerate(seqs):
+
+        seq = np.asarray(
+            seq,
+            dtype=np.float32
+        )
+
+        # últimas transacciones
+        seq = seq[-max_len:]
+
+        L = len(seq)
+
+        lengths[i] = L
+
+        if L > 0:
+
+            # RIGHT PADDING
+            out[i, :L, :] = seq
+
+    return out, lengths
+
+
+def pad_cat_sequences(
+    seqs,
+    max_len
+):
+
+    """
+    Igual que la función anterior,
+    pero para variables categóricas.
+    """
+
+    out = np.zeros(
+
+        (
+            len(seqs),
+            max_len
+        ),
+
+        dtype=np.int64
+    )
+
+    for i, seq in enumerate(seqs):
+
+        seq = np.asarray(
+            seq,
+            dtype=np.int64
+        )
+
+        seq = seq[-max_len:]
+
+        L = len(seq)
+
+        if L > 0:
+
+            out[i, :L] = seq
+
+    return out
+
+
+# ============================================================
+# 5) PREPROCESS CARTERA
+#
+# UNA FILA:
+#
+# cuenta + business_date
+#
+# representa una FOTOGRAFÍA DEL CLIENTE.
+# ============================================================
+
+def preprocess_base_a(
+    df_a: pd.DataFrame
+):
+
+    df = df_a.copy()
+
+    # --------------------------------------------------------
+    # Homologar nombre de cuenta
+    # --------------------------------------------------------
+
+    if (
+        "NUM_CUENTA" not in df.columns
+        and
+        "nnumcuenta" in df.columns
+    ):
+
+        df = df.rename(
+            columns={
+                "nnumcuenta": "NUM_CUENTA"
+            }
+        )
+
+    required = [
+
+        "NUM_CUENTA",
+        "business_date",
+        "bucket",
+        "UTILL"
+    ]
+
+    missing = [
+        c
+        for c in required
+        if c not in df.columns
+    ]
+
+    if missing:
+
+        raise ValueError(
+            f"Faltan columnas en cartera: {missing}"
+        )
+
+    # --------------------------------------------------------
+    # Cuenta
+    # --------------------------------------------------------
+
+    df["NUM_CUENTA"] = (
+        df["NUM_CUENTA"]
+        .apply(clean_account_id)
+    )
+
+    # --------------------------------------------------------
+    # Fecha del corte
+    # --------------------------------------------------------
+
+    df["business_date"] = pd.to_datetime(
+        df["business_date"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # Estado de mora
+    # --------------------------------------------------------
+
+    df["bucket"] = pd.to_numeric(
+        df["bucket"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # Utilización
+    # --------------------------------------------------------
+
+    df["UTILL"] = pd.to_numeric(
+        df["UTILL"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # Balance
+    # --------------------------------------------------------
+
+    if "nbalancee" not in df.columns:
+
+        df["nbalancee"] = np.nan
+
+    else:
+
+        df["nbalancee"] = pd.to_numeric(
+            df["nbalancee"],
+            errors="coerce"
+        )
+
+    # --------------------------------------------------------
+    # Fecha apertura
+    # --------------------------------------------------------
+
+    if "open_date" not in df.columns:
+
+        df["open_date"] = pd.NaT
+
+    else:
+
+        df["open_date"] = pd.to_datetime(
+            df["open_date"],
+            errors="coerce"
+        )
+
+    # --------------------------------------------------------
+    # Primer uso
+    # --------------------------------------------------------
+
+    if "first_use_dt" not in df.columns:
+
+        df["first_use_dt"] = pd.NaT
+
+    else:
+
+        df["first_use_dt"] = pd.to_datetime(
+            df["first_use_dt"],
+            errors="coerce"
+        )
+
+    # --------------------------------------------------------
+    # Quitar registros esenciales inválidos
+    # --------------------------------------------------------
+
+    df = df.dropna(
+        subset=[
+            "NUM_CUENTA",
+            "business_date",
+            "bucket"
+        ]
+    ).copy()
+
+    df["bucket"] = (
+        df["bucket"]
+        .astype(int)
+    )
+
+    # --------------------------------------------------------
+    # Mes real del corte
+    #
+    # Nos permite distinguir:
+    #
+    # enero -> febrero = +1
+    #
+    # enero -> abril = +3
+    #
+    # y no confundir "siguiente fila"
+    # con "siguiente mes".
+    # --------------------------------------------------------
+
+    df["month_index"] = (
+
+        df["business_date"].dt.year
+        *
+        12
+
+        +
+
+        df["business_date"].dt.month
+
+    ).astype(int)
+
+    # --------------------------------------------------------
+    # Una cuenta debería tener una fotografía por mes.
+    # --------------------------------------------------------
+
+    duplicated = df.duplicated(
+        subset=[
+            "NUM_CUENTA",
+            "month_index"
+        ],
+        keep=False
+    )
+
+    if duplicated.any():
+
+        print(
+            "ADVERTENCIA: existen cuentas con "
+            "más de una observación en el mismo mes."
+        )
+
+        print(
+            df.loc[
+                duplicated,
+                [
+                    "NUM_CUENTA",
+                    "business_date",
+                    "bucket"
+                ]
+            ]
+            .head(10)
+        )
+
+    # --------------------------------------------------------
+    # Orden longitudinal
+    # --------------------------------------------------------
+
+    df = (
+        df
+        .sort_values(
+            [
+                "NUM_CUENTA",
+                "business_date"
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    return df
+
+
+# ============================================================
+# 6) PREPROCESS TRANSACCIONES
+#
+# IMPORTANTE:
+#
+# aquí NO calculamos q01 y q99.
+#
+# Eso se aprenderá después usando exclusivamente TRAIN.
+# ============================================================
+
+def preprocess_base_b(
+    df_b: pd.DataFrame
+):
+
+    df = df_b.copy()
+
+    rename_map = {
+
+        "AUTH_CDT": "txn_date",
+
+        "AUTH_AMT": "auth_amt",
+
+        "GIRO": "giro",
+
+        "MERCH_DBA_NME": "merchant",
+
+        "MERCH_DBA_CTY": "city"
+    }
+
+    df = df.rename(
+        columns=rename_map
+    )
+
+    required = [
+
+        "NUM_CUENTA",
+        "txn_date",
+        "auth_amt",
+        "giro",
+        "merchant",
+        "city"
+    ]
+
+    missing = [
+        c
+        for c in required
+        if c not in df.columns
+    ]
+
+    if missing:
+
+        raise ValueError(
+            f"Faltan columnas en transacciones: {missing}"
+        )
+
+    # --------------------------------------------------------
+    # Cuenta
+    # --------------------------------------------------------
+
+    df["NUM_CUENTA"] = (
+        df["NUM_CUENTA"]
+        .apply(clean_account_id)
+    )
+
+    # --------------------------------------------------------
+    # Fecha
+    # --------------------------------------------------------
+
+    df["txn_date"] = pd.to_datetime(
+        df["txn_date"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # Monto
+    # --------------------------------------------------------
+
+    df["auth_amt"] = (
+        df["auth_amt"]
+        .apply(clean_amount)
+    )
+
+    # --------------------------------------------------------
+    # Categorías
+    # --------------------------------------------------------
+
+    for col in [
+        "giro",
+        "merchant",
+        "city"
+    ]:
+
+        df[col] = (
+            df[col]
+            .apply(clean_bytes_string)
+        )
+
+    # --------------------------------------------------------
+    # Quitar información inválida
+    # --------------------------------------------------------
+
+    df = df.dropna(
+        subset=[
+            "NUM_CUENTA",
+            "txn_date",
+            "auth_amt"
+        ]
+    ).copy()
+
+    # --------------------------------------------------------
+    # Orden cronológico REAL de cada cuenta
+    # --------------------------------------------------------
+
+    df = (
+        df
+        .sort_values(
+            [
+                "NUM_CUENTA",
+                "txn_date"
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+    # --------------------------------------------------------
+    # Tiempo desde transacción anterior
+    #
+    # Sólo usa pasado.
+    # No genera leakage.
+    # --------------------------------------------------------
+
+    previous_date = (
+
+        df
+        .groupby(
+            "NUM_CUENTA",
+            sort=False
+        )["txn_date"]
+        .shift(1)
+    )
+
+    df["delta_days"] = (
+
+        (
+            df["txn_date"]
+            -
+            previous_date
+        )
+        .dt
+        .total_seconds()
+
+        /
+
+        86400
+    )
+
+    df["delta_days"] = (
+
+        df["delta_days"]
+        .fillna(0)
+        .clip(lower=0)
+        .astype(np.float32)
+    )
+
+    # --------------------------------------------------------
+    # Calendario
+    # --------------------------------------------------------
+
+    df["day_of_week"] = (
+
+        df["txn_date"]
+        .dt
+        .dayofweek
+        .astype(np.float32)
+    )
+
+    df["is_weekend"] = (
+
+        df["day_of_week"]
+        .isin([5, 6])
+        .astype(np.float32)
+    )
+
+    return df
+
+
+# ============================================================
+# 7) TARGET A
+#
+# PREDICCIÓN DE ENTRADA A MORA
+#
+# bucket actual = 0
+#
+# TG = 1:
+# aparece bucket >= threshold_bad
+# EN CUALQUIERA de los próximos 3 meses.
+#
+#
+# EJEMPLO:
+#
+# marzo   0   TG=1
+# abril   0   TG=1
+# mayo    0   TG=1
+# junio   1   evento
+#
+#
+# Si vuelve posteriormente a bucket 0,
+# por default NO vuelve a utilizarse.
+# ============================================================
+
+def build_target_A_entry_bad(
+    df_a: pd.DataFrame,
+    horizon_months: int = 3,
+    threshold_bad: int = 1,
+    keep_only_before_first_bad: bool = True
+):
+
+    df = df_a.copy()
+
+    output = []
+
+    # ========================================================
+    # Cada cuenta se estudia longitudinalmente.
+    # ========================================================
+
+    for account, g in df.groupby(
+        "NUM_CUENTA",
+        sort=False
+    ):
+
+        g = (
+            g
+            .sort_values("business_date")
+            .copy()
+        )
+
+        buckets = (
+            g["bucket"]
+            .to_numpy()
+        )
+
+        months = (
+            g["month_index"]
+            .to_numpy()
+        )
+
+        n = len(g)
+
+        target = np.full(
+            n,
+            np.nan
+        )
+
+        eligible = np.zeros(
+            n,
+            dtype=np.int8
+        )
+
+        # ----------------------------------------------------
+        # Primera aparición de mora
+        # ----------------------------------------------------
+
+        bad_positions = np.where(
+            buckets >= threshold_bad
+        )[0]
+
+        first_bad_idx = (
+
+            bad_positions[0]
+
+            if len(bad_positions) > 0
+
+            else None
+        )
+
+        # ====================================================
+        # Cada business_date es una muestra candidata.
+        # ====================================================
+
+        for i in range(n):
+
+            # ------------------------------------------------
+            # Target A sólo evalúa clientes CURRENT
+            # ------------------------------------------------
+
+            if buckets[i] != 0:
+                continue
+
+            # ------------------------------------------------
+            # Si ya tuvo mora previamente,
+            # no reconstruimos un nuevo episodio.
+            # ------------------------------------------------
+
+            if (
+                keep_only_before_first_bad
+                and
+                first_bad_idx is not None
+                and
+                i >= first_bad_idx
+            ):
+                continue
+
+            # ------------------------------------------------
+            # Necesitamos H registros futuros completos
+            # ------------------------------------------------
+
+            if i + horizon_months >= n:
+                continue
+
+            future_months = months[
+                i + 1:
+                i + horizon_months + 1
+            ]
+
+            # ------------------------------------------------
+            # Además deben ser H MESES REALES consecutivos.
+            #
+            # Ejemplo correcto:
+            #
+            # t = enero
+            #
+            # febrero
+            # marzo
+            # abril
+            #
+            # Si falta marzo, NO etiquetamos enero.
+            # ------------------------------------------------
+
+            expected_months = (
+                months[i]
+                +
+                np.arange(
+                    1,
+                    horizon_months + 1
+                )
+            )
+
+            if not np.array_equal(
+                future_months,
+                expected_months
+            ):
+                continue
+
+            future_buckets = buckets[
+                i + 1:
+                i + horizon_months + 1
+            ]
+
+            eligible[i] = 1
+
+            # ------------------------------------------------
+            # TG = 1 si aparece mora en cualquier momento
+            # de los próximos H meses.
+            # ------------------------------------------------
+
+            target[i] = int(
+                np.max(future_buckets)
+                >=
+                threshold_bad
+            )
+
+        g["eligible_A"] = eligible
+
+        g["target_A_entry_bad"] = target
+
+        output.append(g)
+
+    out = (
+        pd.concat(
+            output,
+            ignore_index=True
+        )
+    )
+
+    # --------------------------------------------------------
+    # Quitamos observaciones censuradas
+    # --------------------------------------------------------
+
+    out = out[
+        out["eligible_A"] == 1
+    ].copy()
+
+    out["target_A_entry_bad"] = (
+
+        out["target_A_entry_bad"]
+        .astype(np.int8)
+    )
+
+    return out
+
+
+# ============================================================
+# 8) TARGET B
+#
+# CUALQUIER BUCKET ACTUAL
+#
+# TG = 1 si empeora al menos worsening_step
+# durante los próximos H meses.
+# ============================================================
+
+def build_target_B_bucket_worsening(
+    df_a: pd.DataFrame,
+    horizon_months: int = 3,
+    worsening_step: int = 1
+):
+
+    df = df_a.copy()
+
+    output = []
+
+    for account, g in df.groupby(
+        "NUM_CUENTA",
+        sort=False
+    ):
+
+        g = (
+            g
+            .sort_values("business_date")
+            .copy()
+        )
+
+        buckets = (
+            g["bucket"]
+            .to_numpy()
+        )
+
+        months = (
+            g["month_index"]
+            .to_numpy()
+        )
+
+        n = len(g)
+
+        target = np.full(
+            n,
+            np.nan
+        )
+
+        eligible = np.zeros(
+            n,
+            dtype=np.int8
+        )
+
+        for i in range(n):
+
+            if i + horizon_months >= n:
+                continue
+
+            future_months = months[
+                i + 1:
+                i + horizon_months + 1
+            ]
+
+            expected_months = (
+
+                months[i]
+
+                +
+
+                np.arange(
+                    1,
+                    horizon_months + 1
+                )
+            )
+
+            # ------------------------------------------------
+            # Si faltan cortes mensuales,
+            # no creamos la etiqueta.
+            # ------------------------------------------------
+
+            if not np.array_equal(
+                future_months,
+                expected_months
+            ):
+                continue
+
+            future_buckets = buckets[
+                i + 1:
+                i + horizon_months + 1
+            ]
+
+            eligible[i] = 1
+
+            target[i] = int(
+
+                np.max(future_buckets)
+
+                >=
+
+                (
+                    buckets[i]
+                    +
+                    worsening_step
+                )
+            )
+
+        g["eligible_B"] = eligible
+
+        g["target_B_worsen"] = target
+
+        output.append(g)
+
+    out = pd.concat(
+        output,
+        ignore_index=True
+    )
+
+    out = out[
+        out["eligible_B"] == 1
+    ].copy()
+
+    out["target_B_worsen"] = (
+
+        out["target_B_worsen"]
+        .astype(np.int8)
+    )
+
+    return out
+
+
+# ============================================================
+# 9) SPLIT TEMPORAL
+#
+# EL SPLIT ES SOBRE business_date,
+# NO SOBRE NUM_CUENTA.
+#
+# Por tanto un mismo cliente puede aparecer:
+#
+# octubre TRAIN
+# noviembre TRAIN
+# diciembre VALID
+#
+# Esto es INTENCIONAL para este modelo conductual.
+# ============================================================
+
+def split_base_a_temporal(
+    df_a_target: pd.DataFrame
+):
+
+    train = df_a_target[
+
+        df_a_target["business_date"]
+        <
+        pd.Timestamp("2025-12-01")
+
+    ].copy()
+
+    val = df_a_target[
+
+        (
+            df_a_target["business_date"]
+            >=
+            pd.Timestamp("2025-12-01")
+        )
+
+        &
+
+        (
+            df_a_target["business_date"]
+            <
+            pd.Timestamp("2026-03-01")
+        )
+
+    ].copy()
+
+    test = df_a_target[
+
+        (
+            df_a_target["business_date"]
+            >=
+            pd.Timestamp("2026-03-01")
+        )
+
+        &
+
+        (
+            df_a_target["business_date"]
+            <
+            pd.Timestamp("2026-05-01")
+        )
+
+    ].copy()
+
+    return train, val, test
+
+
+# ============================================================
+# 10) REDUCIR CARDINALIDAD
+#
+# TODO se aprende exclusivamente con TRAIN.
+# ============================================================
+
+def reduce_cardinality_train_only(
+    df_train,
+    df_val,
+    df_test
+):
+
+    train = df_train.copy()
+    val = df_val.copy()
+    test = df_test.copy()
+
+    # --------------------------------------------------------
+    # CATEGORÍAS PRINCIPALES
+    # --------------------------------------------------------
+
+    top_giro = (
+
+        train["giro"]
+        .value_counts()
+        .head(CFG.top_giro)
+        .index
+    )
+
+    top_city = (
+
+        train["city"]
+        .value_counts()
+        .head(CFG.top_city)
+        .index
+    )
+
+    top_merchant = (
+
+        train["merchant"]
+        .value_counts()
+        .head(CFG.top_merchant)
+        .index
+    )
+
+    for d in [
+        train,
+        val,
+        test
+    ]:
+
+        d["giro_r"] = (
+
+            d["giro"]
+            .where(
+                d["giro"].isin(top_giro),
+                "OTHER_GIRO"
+            )
+        )
+
+        d["city_r"] = (
+
+            d["city"]
+            .where(
+                d["city"].isin(top_city),
+                "OTHER_CITY"
+            )
+        )
+
+        d["merchant_r"] = (
+
+            d["merchant"]
+            .where(
+                d["merchant"].isin(top_merchant),
+                "OTHER_MERCHANT"
+            )
+        )
+
+        # ----------------------------------------------------
+        # Interacciones
+        # ----------------------------------------------------
+
+        d["giro_city"] = (
+
+            d["giro_r"]
+            +
+            "||"
+            +
+            d["city_r"]
+        )
+
+        d["giro_amount_bin"] = (
+
+            d["giro_r"]
+
+            +
+
+            "||"
+
+            +
+
+            d["amount_bin"]
+            .astype(str)
+        )
+
+    # --------------------------------------------------------
+    # TOP interacciones aprendido sólo en TRAIN
+    # --------------------------------------------------------
+
+    top_giro_city = (
+
+        train["giro_city"]
+        .value_counts()
+        .head(CFG.top_giro_city)
+        .index
+    )
+
+    top_giro_amount_bin = (
+
+        train["giro_amount_bin"]
+        .value_counts()
+        .head(CFG.top_giro_amount_bin)
+        .index
+    )
+
+    for d in [
+        train,
+        val,
+        test
+    ]:
+
+        d["giro_city_r"] = (
+
+            d["giro_city"]
+            .where(
+                d["giro_city"].isin(
+                    top_giro_city
+                ),
+                "OTHER_GIRO_CITY"
+            )
+        )
+
+        d["giro_amount_bin_r"] = (
+
+            d["giro_amount_bin"]
+            .where(
+                d["giro_amount_bin"].isin(
+                    top_giro_amount_bin
+                ),
+                "OTHER_GIRO_AMOUNT_BIN"
+            )
+        )
+
+    # --------------------------------------------------------
+    # Guardamos exactamente lo aprendido en TRAIN
+    # para producción.
+    # --------------------------------------------------------
+
+    top_categories = {
+
+        "giro":
+            list(top_giro),
+
+        "city":
+            list(top_city),
+
+        "merchant":
+            list(top_merchant),
+
+        "giro_city":
+            list(top_giro_city),
+
+        "giro_amount_bin":
+            list(top_giro_amount_bin)
+    }
+
+    return (
+        train,
+        val,
+        test,
+        top_categories
+    )
+
+
+# ============================================================
+# 11) CONSTRUCTOR DE MUESTRAS
+#
+# ESTA ES LA FUNCIÓN MÁS IMPORTANTE PARA TU DUDA.
+#
+#
+# Cada iteración:
+#
+# cuenta A + corte enero
+#      ↓
+# transacciones disponibles hasta enero
+#      ↓
+# muestra 1
+#
+#
+# cuenta A + corte febrero
+#      ↓
+# transacciones disponibles hasta febrero
+#      ↓
+# muestra 2
+#
+#
+# cuenta A + corte marzo
+#      ↓
+# transacciones disponibles hasta marzo
+#      ↓
+# muestra 3
+#
+#
+# AQUÍ ES DONDE SE GENERA LA SUPERPOSICIÓN.
+# ============================================================
+
+def build_samples(
+    df_a_split,
+    df_b_split,
+    vocabs,
+    target_col
+):
+
+    num_seq_list = []
+
+    cat_seq_dict = {
+
+        col: []
+
+        for col in CAT_SEQ_COLS
+    }
+
+    static_list = []
+
+    y_list = []
+
+    sample_keys = []
+
+    # --------------------------------------------------------
+    # Agrupamos transacciones por cuenta para no buscar
+    # constantemente en toda la tabla.
+    # --------------------------------------------------------
+
+    grouped_b = (
+        df_b_split
+        .groupby(
+            "NUM_CUENTA",
+            sort=False
+        )
+    )
+
+    # ========================================================
+    # CADA FILA DE CARTERA = UNA MUESTRA
+    # ========================================================
+
+    for row in df_a_split.itertuples(
+        index=False
+    ):
+
+        account = row.NUM_CUENTA
+
+        asof = pd.Timestamp(
+            row.business_date
+        )
+
+        # ----------------------------------------------------
+        # Cuenta sin transacciones
+        # ----------------------------------------------------
+
+        if account not in grouped_b.groups:
+            continue
+
+        account_txn = (
+            grouped_b
+            .get_group(account)
+        )
+
+        # ====================================================
+        # CRÍTICO
+        #
+        # business_date se interpreta como corte inclusivo
+        # del día completo.
+        #
+        # Si business_date = 31-enero 00:00,
+        # incluimos también las transacciones del 31-enero.
+        # ====================================================
+
+        cutoff_exclusive = (
+
+            asof.normalize()
+
+            +
+
+            pd.Timedelta(days=1)
+        )
+
+        hist = account_txn[
+
+            account_txn["txn_date"]
+            <
+            cutoff_exclusive
+
+        ].copy()
+
+        # ----------------------------------------------------
+        # Necesitamos al menos N transacciones
+        # ----------------------------------------------------
+
+        if len(hist) < CFG.min_txn_history:
+            continue
+
+        # ====================================================
+        # ÚLTIMAS 100 TRANSACCIONES DISPONIBLES
+        # EN ESE business_date
+        # ====================================================
+
+        hist = (
+
+            hist
+            .sort_values("txn_date")
+            .tail(CFG.max_seq_len)
+            .copy()
+        )
+
+        # ----------------------------------------------------
+        # Qué tan antigua es cada transacción respecto
+        # al corte actual.
+        # ----------------------------------------------------
+
+        hist["days_to_asof"] = (
+
+            (
+                cutoff_exclusive
+                -
+                hist["txn_date"]
+            )
+            .dt
+            .total_seconds()
+
+            /
+
+            86400
+        )
+
+        hist["days_to_asof"] = (
+
+            hist["days_to_asof"]
+            .clip(lower=0)
+            .astype(np.float32)
+        )
+
+        # ====================================================
+        # SECUENCIA NUMÉRICA
+        # ====================================================
+
+        seq_num = (
+
+            hist[
+                SEQ_NUM_COLS
+            ]
+            .to_numpy(
+                dtype=np.float32
+            )
+        )
+
+        num_seq_list.append(
+            seq_num
+        )
+
+        # ====================================================
+        # SECUENCIAS CATEGÓRICAS
+        # ====================================================
+
+        for col in CAT_SEQ_COLS:
+
+            ids = (
+
+                hist[col]
+                .astype(str)
+                .map(
+                    lambda x:
+                    vocabs[col].get(
+                        x,
+                        vocabs[col]["<UNK>"]
+                    )
+                )
+                .to_numpy(
+                    dtype=np.int64
+                )
+            )
+
+            cat_seq_dict[col].append(
+                ids
+            )
+
+        # ====================================================
+        # VARIABLES ESTÁTICAS DEL CORTE
+        # ====================================================
+
+        account_age_days = np.nan
+
+        first_use_age_days = np.nan
+
+        if pd.notna(row.open_date):
+
+            age = (
+                asof
+                -
+                row.open_date
+            ).days
+
+            if age >= 0:
+                account_age_days = age
+
+        if pd.notna(row.first_use_dt):
+
+            age = (
+                asof
+                -
+                row.first_use_dt
+            ).days
+
+            if age >= 0:
+                first_use_age_days = age
+
+        static_feats = np.array(
+
+            [
+
+                # balance
+                0.0
+                if pd.isna(row.nbalancee)
+                else float(row.nbalancee),
+
+                # antigüedad cuenta
+                0.0
+                if pd.isna(account_age_days)
+                else float(account_age_days),
+
+                # antigüedad primer uso
+                0.0
+                if pd.isna(first_use_age_days)
+                else float(first_use_age_days),
+
+                # utilización
+                0.0
+                if pd.isna(row.UTILL)
+                else float(row.UTILL)
+
+            ],
+
+            dtype=np.float32
+        )
+
+        static_list.append(
+            static_feats
+        )
+
+        # ====================================================
+        # TARGET DEL CORTE
+        # ====================================================
+
+        y_list.append(
+            int(
+                getattr(
+                    row,
+                    target_col
+                )
+            )
+        )
+
+        # ====================================================
+        # IDENTIFICADOR DE LA MUESTRA
+        #
+        # Esto te permitirá después revisar:
+        #
+        # cuenta X enero score ...
+        # cuenta X febrero score ...
+        # cuenta X marzo score ...
+        # ====================================================
+
+        sample_keys.append(
+            (
+                account,
+                asof
+            )
+        )
+
+    # --------------------------------------------------------
+    # Validación
+    # --------------------------------------------------------
+
+    if len(y_list) == 0:
+
+        raise ValueError(
+            "No se generó ninguna muestra. "
+            "Revisa fechas, cuentas y min_txn_history."
+        )
+
+    # ========================================================
+    # RIGHT PADDING
+    # ========================================================
+
+    X_num, lengths = pad_num_sequences(
+
+        num_seq_list,
+
+        CFG.max_seq_len,
+
+        len(SEQ_NUM_COLS)
+    )
+
+    X_cat = {
+
+        col:
+            pad_cat_sequences(
+                cat_seq_dict[col],
+                CFG.max_seq_len
+            )
+
+        for col in CAT_SEQ_COLS
+    }
+
+    X_static = np.vstack(
+        static_list
+    ).astype(np.float32)
+
+    y = np.asarray(
+        y_list,
+        dtype=np.int64
+    )
+
+    return (
+
+        X_num,
+        X_cat,
+        X_static,
+        y,
+        lengths,
+        sample_keys
+    )
+
+
+# ============================================================
+# 12) DATASET PYTORCH
+# ============================================================
+
+class AccountSequenceDataset(Dataset):
+
+    """
+    Simplemente convierte los arrays construidos arriba
+    a tensores PyTorch.
+    """
+
+    def __init__(
+        self,
+        X_num,
+        X_cat,
+        X_static,
+        y,
+        lengths
+    ):
+
+        self.X_num = torch.tensor(
+            X_num,
+            dtype=torch.float32
+        )
+
+        self.X_cat = {
+
+            k:
+                torch.tensor(
+                    v,
+                    dtype=torch.long
+                )
+
+            for k, v
+            in X_cat.items()
+        }
+
+        self.X_static = torch.tensor(
+            X_static,
+            dtype=torch.float32
+        )
+
+        self.y = torch.tensor(
+            y,
+            dtype=torch.float32
+        )
+
+        self.lengths = torch.tensor(
+            lengths,
+            dtype=torch.long
+        )
+
+    def __len__(self):
+
+        return len(self.y)
+
+    def __getitem__(
+        self,
+        idx
+    ):
+
+        item = {
+
+            "x_num":
+                self.X_num[idx],
+
+            "x_static":
+                self.X_static[idx],
+
+            "length":
+                self.lengths[idx],
+
+            "y":
+                self.y[idx]
+        }
+
+        for k, v in self.X_cat.items():
+
+            item[k] = v[idx]
+
+        return item
+
+
+# ============================================================
+# 13) LIMPIAR LAS DOS BASES
+# ============================================================
+
+df_a_clean = preprocess_base_a(
+    cartera
+)
+
+df_b_clean = preprocess_base_b(
+    log_aut
+)
+
+
+# ============================================================
+# 14) CREAR TARGET
+#
+# ESTE ES EL MODELO PRINCIPAL:
+#
+# TG=1:
+# entra a mora en próximos 3 meses
+#
+# TG=0:
+# permanece sin mora durante esos 3 meses
+# ============================================================
+
+df_a_target = build_target_A_entry_bad(
+
+    df_a_clean,
+
+    horizon_months=3,
+
+    threshold_bad=1,
+
+    keep_only_before_first_bad=True
+)
+
+
+print(
+    "\nDistribución target:"
+)
+
+print(
+    df_a_target[
+        "target_A_entry_bad"
+    ]
+    .value_counts(
+        normalize=True
+    )
+)
+
+
+# ============================================================
+# 15) SPLIT POR business_date
+# ============================================================
+
+a_train, a_val, a_test = (
+    split_base_a_temporal(
+        df_a_target
+    )
+)
+
+
+print(
+    "\nCortes:"
+)
+
+print(
+    "TRAIN:",
+    a_train["business_date"].min(),
+    a_train["business_date"].max(),
+    len(a_train)
+)
+
+print(
+    "VALID:",
+    a_val["business_date"].min(),
+    a_val["business_date"].max(),
+    len(a_val)
+)
+
+print(
+    "TEST:",
+    a_test["business_date"].min(),
+    a_test["business_date"].max(),
+    len(a_test)
+)
+
+
+# ============================================================
+# 16) CREAR VENTANAS TRANSACCIONALES
+#
+# Son acumulativas.
+#
+# VALID necesita acceso a las transacciones anteriores
+# que ocurrieron durante TRAIN.
+#
+# NO hacemos:
+#
+# valid = sólo transacciones de validación
+#
+# porque destruiríamos el historial del cliente.
+# ============================================================
+
+max_train_date = (
+    a_train["business_date"]
+    .max()
+    .normalize()
+    +
+    pd.Timedelta(days=1)
+)
+
+max_val_date = (
+    a_val["business_date"]
+    .max()
+    .normalize()
+    +
+    pd.Timedelta(days=1)
+)
+
+max_test_date = (
+    a_test["business_date"]
+    .max()
+    .normalize()
+    +
+    pd.Timedelta(days=1)
+)
+
+
+b_train = df_b_clean[
+
+    df_b_clean["txn_date"]
+    <
+    max_train_date
+
+].copy()
+
+
+b_val = df_b_clean[
+
+    df_b_clean["txn_date"]
+    <
+    max_val_date
+
+].copy()
+
+
+b_test = df_b_clean[
+
+    df_b_clean["txn_date"]
+    <
+    max_test_date
+
+].copy()
+
+
+# ============================================================
+# 17) CLIPPING DE MONTOS
+#
+# APRENDEMOS q01/q99 SÓLO EN TRAIN.
+# ============================================================
+
+q01 = (
+    b_train["auth_amt"]
+    .quantile(0.01)
+)
+
+q99 = (
+    b_train["auth_amt"]
+    .quantile(0.99)
+)
+
+
+print(
+    "\nMonto TRAIN:"
+)
+
+print(
+    "q01 =", q01,
+    "q99 =", q99
+)
+
+
+# ============================================================
+# APLICAMOS LOS MISMOS q01/q99
+# A TRAIN, VALID Y TEST.
+# ============================================================
+
+for d in [
+    b_train,
+    b_val,
+    b_test
+]:
+
+    # --------------------------------------------------------
+    # Clip
+    # --------------------------------------------------------
+
+    d["auth_amt_clip"] = (
+
+        d["auth_amt"]
+        .clip(
+            lower=q01,
+            upper=q99
+        )
+    )
+
+    # --------------------------------------------------------
+    # Signo
+    #
+    # -1
+    #  0
+    # +1
+    # --------------------------------------------------------
+
+    d["amount_sign"] = (
+
+        np.sign(
+            d["auth_amt_clip"]
+        )
+        .astype(np.float32)
+    )
+
+    # --------------------------------------------------------
+    # Magnitud log
+    # --------------------------------------------------------
+
+    d["amount_abs_log"] = (
+
+        np.log1p(
+            np.abs(
+                d["auth_amt_clip"]
+            )
+        )
+        .astype(np.float32)
+    )
+
+    # --------------------------------------------------------
+    # Bin de magnitud
+    # --------------------------------------------------------
+
+    d["amount_bin"] = pd.cut(
+
+        np.abs(
+            d["auth_amt_clip"]
+        ),
+
+        bins=list(
+            CFG.amount_bins
+        ),
+
+        labels=False,
+
+        include_lowest=True
+    )
+
+    d["amount_bin"] = (
+
+        d["amount_bin"]
+        .fillna(-1)
+        .astype(int)
+        .astype(str)
+    )
+
+
+# ============================================================
+# 18) REDUCCIÓN DE CARDINALIDAD
+#
+# TOP categorías aprendidas sólo de TRAIN
+# ============================================================
+
+(
+    b_train,
+    b_val,
+    b_test,
+    top_categories
+
+) = reduce_cardinality_train_only(
+
+    b_train,
+    b_val,
+    b_test
+)
+
+
+# ============================================================
+# 19) VOCABULARIOS
+#
+# NUEVAMENTE:
+# SÓLO TRAIN.
+# ============================================================
+
+vocabs = {
+
+    col:
+        build_vocab(
+            b_train[col]
+        )
+
+    for col in CAT_SEQ_COLS
+}
+
+
+vocab_sizes = {
+
+    k:
+        len(v)
+
+    for k, v
+    in vocabs.items()
+}
+
+
+print(
+    "\nVocabularios:"
+)
+
+for k, v in vocab_sizes.items():
+
+    print(
+        k,
+        v
+    )
+
+
+# ============================================================
+# 20) GENERAR LAS MUESTRAS
+#
+# AQUÍ OCURRE:
+#
+# CLIENTE × BUSINESS_DATE
+# ============================================================
+
+(
+    X_num_train,
+    X_cat_train,
+    X_static_train,
+    y_train,
+    len_train,
+    keys_train
+
+) = build_samples(
+
+    a_train,
+
+    b_train,
+
+    vocabs,
+
+    target_col="target_A_entry_bad"
+)
+
+
+(
+    X_num_val,
+    X_cat_val,
+    X_static_val,
+    y_val,
+    len_val,
+    keys_val
+
+) = build_samples(
+
+    a_val,
+
+    b_val,
+
+    vocabs,
+
+    target_col="target_A_entry_bad"
+)
+
+
+(
+    X_num_test,
+    X_cat_test,
+    X_static_test,
+    y_test,
+    len_test,
+    keys_test
+
+) = build_samples(
+
+    a_test,
+
+    b_test,
+
+    vocabs,
+
+    target_col="target_A_entry_bad"
+)
+
+
+print(
+    "\nMuestras:"
+)
+
+print(
+    "TRAIN:",
+    len(y_train)
+)
+
+print(
+    "VALID:",
+    len(y_val)
+)
+
+print(
+    "TEST:",
+    len(y_test)
+)
+
+
+# ============================================================
+# 21) EJEMPLO DE EVOLUCIÓN DE UN CLIENTE
+#
+# ESTO TE PERMITE VER EXACTAMENTE LAS MUESTRAS SUPERPUESTAS.
+# ============================================================
+
+keys_train_df = pd.DataFrame(
+
+    keys_train,
+
+    columns=[
+        "NUM_CUENTA",
+        "business_date"
+    ]
+)
+
+
+print(
+    "\nEjemplo de número de cortes por cuenta:"
+)
+
+print(
+    keys_train_df[
+        "NUM_CUENTA"
+    ]
+    .value_counts()
+    .head()
+)
+
+
+# ============================================================
+# 22) STANDARD SCALER
+#
+# TAMBIÉN DEBE APRENDERSE SÓLO EN TRAIN.
+#
+# MUY IMPORTANTE:
+#
+# NO incluimos PAD en el ajuste del scaler.
+# ============================================================
+
+seq_scaler = StandardScaler()
+
+
+train_real_timesteps = np.concatenate(
+
+    [
+
+        X_num_train[
+            i,
+            :len_train[i],
+            :
+        ]
+
+        for i in range(
+            len(X_num_train)
+        )
+
+    ],
+
+    axis=0
+)
+
+
+seq_scaler.fit(
+    train_real_timesteps
+)
+
+
+# ------------------------------------------------------------
+# Transformar únicamente posiciones reales.
+#
+# PAD queda exactamente en 0.
+# ------------------------------------------------------------
+
+for X, lengths in [
+
+    (
+        X_num_train,
+        len_train
+    ),
+
+    (
+        X_num_val,
+        len_val
+    ),
+
+    (
+        X_num_test,
+        len_test
+    )
+
+]:
+
+    for i, L in enumerate(
+        lengths
+    ):
+
+        if L > 0:
+
+            X[
+                i,
+                :L,
+                :
+            ] = seq_scaler.transform(
+
+                X[
+                    i,
+                    :L,
+                    :
+                ]
+            )
+
+
+# ============================================================
+# ESCALAR VARIABLES ESTÁTICAS
+# ============================================================
+
+static_scaler = StandardScaler()
+
+static_scaler.fit(
+    X_static_train
+)
+
+X_static_train = (
+    static_scaler
+    .transform(
+        X_static_train
+    )
+    .astype(np.float32)
+)
+
+X_static_val = (
+    static_scaler
+    .transform(
+        X_static_val
+    )
+    .astype(np.float32)
+)
+
+X_static_test = (
+    static_scaler
+    .transform(
+        X_static_test
+    )
+    .astype(np.float32)
+)
+
+
+# ============================================================
+# 23) DATASETS
+# ============================================================
+
+train_dataset = AccountSequenceDataset(
+
+    X_num_train,
+    X_cat_train,
+    X_static_train,
+    y_train,
+    len_train
+)
+
+
+val_dataset = AccountSequenceDataset(
+
+    X_num_val,
+    X_cat_val,
+    X_static_val,
+    y_val,
+    len_val
+)
+
+
+test_dataset = AccountSequenceDataset(
+
+    X_num_test,
+    X_cat_test,
+    X_static_test,
+    y_test,
+    len_test
+)
+
+
+# ============================================================
+# 24) DATALOADERS
+#
+# TRAIN sí se revuelve.
+#
+# Esto NO destruye la temporalidad interna.
+#
+# Cada muestra ya contiene su secuencia cronológica.
+# ============================================================
+
+train_loader = DataLoader(
+
+    train_dataset,
+
+    batch_size=64,
+
+    shuffle=True
+)
+
+
+val_loader = DataLoader(
+
+    val_dataset,
+
+    batch_size=128,
+
+    shuffle=False
+)
+
+
+test_loader = DataLoader(
+
+    test_dataset,
+
+    batch_size=128,
+
+    shuffle=False
+)
+
+
+# ============================================================
+# 25) EMBEDDINGS
+# ============================================================
+
+emb_dims = {
+
+    "giro_r": 8,
+
+    "merchant_r": 32,
+
+    "city_r": 8,
+
+    "giro_city_r": 16,
+
+    "giro_amount_bin_r": 8
+}
+
+
+# ============================================================
+# 26) MODELO LSTM
+# ============================================================
+
+class RealisticTdcLSTM(nn.Module):
+
+    """
+    El modelo recibe para cada business_date:
+
+    1. secuencia cronológica de transacciones
+    2. variables categóricas por transacción
+    3. variables estáticas del corte
+
+    La LSTM representa el comportamiento transaccional
+    disponible hasta ese momento.
+    """
+
+    def __init__(
+        self,
+        vocab_sizes,
+        emb_dims,
+        num_seq_features,
+        num_static_features,
+        hidden_size=64
+    ):
+
+        super().__init__()
+
+        # ----------------------------------------------------
+        # Embedding por variable categórica
+        # ----------------------------------------------------
+
+        self.embeddings = nn.ModuleDict({
+
+            name:
+                nn.Embedding(
+
+                    vocab_sizes[name],
+
+                    emb_dims[name],
+
+                    padding_idx=0
+                )
+
+            for name
+            in vocab_sizes
+        })
+
+        emb_total = sum(
+            emb_dims.values()
+        )
+
+        lstm_input_dim = (
+
+            num_seq_features
+
+            +
+
+            emb_total
+        )
+
+        # ----------------------------------------------------
+        # Secuencia
+        # ----------------------------------------------------
+
+        self.lstm = nn.LSTM(
+
+            input_size=lstm_input_dim,
+
+            hidden_size=hidden_size,
+
+            num_layers=1,
+
+            batch_first=True
+        )
+
+        # ----------------------------------------------------
+        # Cabeza final:
+        #
+        # representación LSTM
+        # +
+        # datos estáticos
+        # ----------------------------------------------------
+
+        self.head = nn.Sequential(
+
+            nn.Linear(
+                hidden_size
+                +
+                num_static_features,
+                64
+            ),
+
+            nn.ReLU(),
+
+            nn.Dropout(0.20),
+
+            nn.Linear(
+                64,
+                1
+            )
+        )
+
+    def forward(
+        self,
+        batch
+    ):
+
+        x_num = batch["x_num"]
+
+        x_static = batch[
+            "x_static"
+        ]
+
+        # pack_padded_sequence necesita lengths en CPU
+        lengths = (
+            batch["length"]
+            .cpu()
+        )
+
+        # ----------------------------------------------------
+        # Embeddings
+        # ----------------------------------------------------
+
+        emb_list = []
+
+        for name in self.embeddings.keys():
+
+            embedding = self.embeddings[
+                name
+            ](
+                batch[name]
+            )
+
+            emb_list.append(
+                embedding
+            )
+
+        # ----------------------------------------------------
+        # Concatenar información de cada transacción
+        # ----------------------------------------------------
+
+        x = torch.cat(
+
+            [
+                x_num
+            ]
+            +
+            emb_list,
+
+            dim=-1
+        )
+
+        # ----------------------------------------------------
+        # Ignorar PAD
+        # ----------------------------------------------------
+
+        packed = (
+            nn.utils.rnn
+            .pack_padded_sequence(
+
+                x,
+
+                lengths,
+
+                batch_first=True,
+
+                enforce_sorted=False
+            )
+        )
+
+        _, (
+            h_n,
+            _
+        ) = self.lstm(
+            packed
+        )
+
+        # Último estado válido
+        h = h_n[-1]
+
+        # ----------------------------------------------------
+        # Añadir información del corte
+        # ----------------------------------------------------
+
+        h = torch.cat(
+
+            [
+                h,
+                x_static
+            ],
+
+            dim=-1
+        )
+
+        logits = (
+            self.head(h)
+            .squeeze(1)
+        )
+
+        return logits
+
+
+# ============================================================
+# 27) INSTANCIAR MODELO
+# ============================================================
+
+model2 = RealisticTdcLSTM(
+
+    vocab_sizes=vocab_sizes,
+
+    emb_dims=emb_dims,
+
+    num_seq_features=len(
+        SEQ_NUM_COLS
+    ),
+
+    num_static_features=len(
+        STATIC_FEATURE_NAMES
+    ),
+
+    hidden_size=64
+)
+
+
+# ============================================================
+# 28) MÉTRICAS
+# ============================================================
+
+def ks_statistic(
+    y_true,
+    y_score
+):
+
+    fpr, tpr, _ = roc_curve(
+        y_true,
+        y_score
+    )
+
+    return np.max(
+        tpr - fpr
+    )
+
+
+@torch.no_grad()
+def predict_loader(
+    model,
+    loader,
+    device
+):
+
+    model.eval()
+
+    all_probs = []
+    all_targets = []
+    all_logits = []
+
+    for batch in loader:
+
+        batch = {
+
+            k:
+                v.to(device)
+
+            for k, v
+            in batch.items()
+        }
+
+        logits = model(
+            batch
+        )
+
+        probs = torch.sigmoid(
+            logits
+        )
+
+        all_logits.append(
+            logits
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        all_probs.append(
+            probs
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+        all_targets.append(
+            batch["y"]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+    return (
+
+        np.concatenate(
+            all_logits
+        ),
+
+        np.concatenate(
+            all_probs
+        ),
+
+        np.concatenate(
+            all_targets
+        )
+    )
+
+
+@torch.no_grad()
+def evaluate_model(
+    model,
+    loader,
+    criterion,
+    device
+):
+
+    model.eval()
+
+    total_loss = 0.0
+
+    n_obs = 0
+
+    for batch in loader:
+
+        batch = {
+
+            k:
+                v.to(device)
+
+            for k, v
+            in batch.items()
+        }
+
+        logits = model(
+            batch
+        )
+
+        loss = criterion(
+
+            logits,
+
+            batch["y"]
+        )
+
+        bs = (
+            batch["y"]
+            .shape[0]
+        )
+
+        total_loss += (
+            loss.item()
+            *
+            bs
+        )
+
+        n_obs += bs
+
+    avg_loss = (
+
+        total_loss
+
+        /
+
+        max(
+            n_obs,
+            1
+        )
+    )
+
+    (
+        logits,
+        probs,
+        y_true
+    ) = predict_loader(
+
+        model,
+        loader,
+        device
+    )
+
+    metrics = {
+
+        "loss":
+            avg_loss
+    }
+
+    try:
+
+        metrics["roc_auc"] = (
+            roc_auc_score(
+                y_true,
+                probs
+            )
+        )
+
+    except Exception:
+
+        metrics["roc_auc"] = np.nan
+
+    try:
+
+        metrics["pr_auc"] = (
+            average_precision_score(
+                y_true,
+                probs
+            )
+        )
+
+    except Exception:
+
+        metrics["pr_auc"] = np.nan
+
+    try:
+
+        metrics["ks"] = (
+            ks_statistic(
+                y_true,
+                probs
+            )
+        )
+
+    except Exception:
+
+        metrics["ks"] = np.nan
+
+    return (
+        metrics,
+        logits,
+        probs,
+        y_true
+    )
+
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device,
+    max_grad_norm=5.0
+):
+
+    model.train()
+
+    total_loss = 0.0
+
+    n_obs = 0
+
+    for batch in loader:
+
+        batch = {
+
+            k:
+                v.to(device)
+
+            for k, v
+            in batch.items()
+        }
+
+        optimizer.zero_grad()
+
+        logits = model(
+            batch
+        )
+
+        loss = criterion(
+
+            logits,
+
+            batch["y"]
+        )
+
+        loss.backward()
+
+        if max_grad_norm is not None:
+
+            torch.nn.utils.clip_grad_norm_(
+
+                model.parameters(),
+
+                max_grad_norm
+            )
+
+        optimizer.step()
+
+        bs = (
+            batch["y"]
+            .shape[0]
+        )
+
+        total_loss += (
+            loss.item()
+            *
+            bs
+        )
+
+        n_obs += bs
+
+    return (
+
+        total_loss
+
+        /
+
+        max(
+            n_obs,
+            1
+        )
+    )
+
+
+# ============================================================
+# 29) EARLY STOPPING
+# ============================================================
+
+class EarlyStopping:
+
+    def __init__(
+        self,
+        patience=6,
+        mode="max",
+        min_delta=1e-4
+    ):
+
+        self.patience = patience
+
+        self.mode = mode
+
+        self.min_delta = min_delta
+
+        self.best_score = None
+
+        self.counter = 0
+
+        self.best_state = None
+
+        self.should_stop = False
+
+    def step(
+        self,
+        score,
+        model
+    ):
+
+        if not np.isfinite(
+            score
+        ):
+            return
+
+        if self.best_score is None:
+
+            self.best_score = score
+
+            self.best_state = (
+                copy.deepcopy(
+                    model.state_dict()
+                )
+            )
+
+            return
+
+        if self.mode == "max":
+
+            improved = (
+
+                score
+
+                >
+
+                self.best_score
+                +
+                self.min_delta
+            )
+
+        else:
+
+            improved = (
+
+                score
+
+                <
+
+                self.best_score
+                -
+                self.min_delta
+            )
+
+        if improved:
+
+            self.best_score = score
+
+            self.best_state = (
+                copy.deepcopy(
+                    model.state_dict()
+                )
+            )
+
+            self.counter = 0
+
+        else:
+
+            self.counter += 1
+
+            if (
+                self.counter
+                >=
+                self.patience
+            ):
+
+                self.should_stop = True
+
+
+# ============================================================
+# 30) PESO DE CLASE
+#
+# AHORA TG=1 ES MORA.
+#
+# Por tanto pos_weight pesa la clase de riesgo,
+# que es lo que normalmente queremos.
+# ============================================================
+
+def compute_pos_weight(
+    y_train
+):
+
+    y_train = (
+
+        np.asarray(
+            y_train
+        )
+        .astype(int)
+    )
+
+    n_pos = (
+        y_train == 1
+    ).sum()
+
+    n_neg = (
+        y_train == 0
+    ).sum()
+
+    if n_pos == 0:
+
+        return torch.tensor(
+            1.0,
+            dtype=torch.float32
+        )
+
+    return torch.tensor(
+
+        n_neg
+        /
+        n_pos,
+
+        dtype=torch.float32
+    )
+
+
+# ============================================================
+# 31) ENTRENAMIENTO
+# ============================================================
+
+device = torch.device(
+
+    "cuda"
+
+    if torch.cuda.is_available()
+
+    else "cpu"
+)
+
+
+model2 = model2.to(
+    device
+)
+
+
+pos_weight = (
+    compute_pos_weight(
+        y_train
+    )
+    .to(device)
+)
+
+
+criterion = nn.BCEWithLogitsLoss(
+    pos_weight=pos_weight
+)
+
+
+optimizer = torch.optim.Adam(
+
+    model2.parameters(),
+
+    lr=1e-3,
+
+    weight_decay=1e-5
+)
+
+
+scheduler = (
+    torch.optim.lr_scheduler
+    .ReduceLROnPlateau(
+
+        optimizer,
+
+        mode="max",
+
+        factor=0.5,
+
+        patience=2
+    )
+)
+
+
+early_stopper = EarlyStopping(
+
+    patience=6,
+
+    mode="max",
+
+    min_delta=1e-4
+)
+
+
+num_epochs = 30
+
+history = []
+
+
+for epoch in range(
+    1,
+    num_epochs + 1
+):
+
+    train_loss = train_one_epoch(
+
+        model=model2,
+
+        loader=train_loader,
+
+        optimizer=optimizer,
+
+        criterion=criterion,
+
+        device=device,
+
+        max_grad_norm=5.0
+    )
+
+    train_metrics, _, _, _ = (
+        evaluate_model(
+
+            model2,
+
+            train_loader,
+
+            criterion,
+
+            device
+        )
+    )
+
+    val_metrics, _, _, _ = (
+        evaluate_model(
+
+            model2,
+
+            val_loader,
+
+            criterion,
+
+            device
+        )
+    )
+
+    val_auc = (
+        val_metrics[
+            "roc_auc"
+        ]
+    )
+
+    if np.isfinite(
+        val_auc
+    ):
+
+        scheduler.step(
+            val_auc
+        )
+
+        early_stopper.step(
+
+            val_auc,
+
+            model2
+        )
+
+    row = {
+
+        "epoch":
+            epoch,
+
+        "train_loss":
+            train_loss,
+
+        "train_auc":
+            train_metrics["roc_auc"],
+
+        "train_pr_auc":
+            train_metrics["pr_auc"],
+
+        "train_ks":
+            train_metrics["ks"],
+
+        "val_loss":
+            val_metrics["loss"],
+
+        "val_auc":
+            val_metrics["roc_auc"],
+
+        "val_pr_auc":
+            val_metrics["pr_auc"],
+
+        "val_ks":
+            val_metrics["ks"],
+
+        "lr":
+            optimizer.param_groups[0]["lr"]
+    }
+
+    history.append(
+        row
+    )
+
+    print(
+
+        f"Epoch {epoch:02d} | "
+
+        f"train_loss={train_metrics['loss']:.4f} | "
+
+        f"train_auc={train_metrics['roc_auc']:.4f} | "
+
+        f"val_loss={val_metrics['loss']:.4f} | "
+
+        f"val_auc={val_metrics['roc_auc']:.4f} | "
+
+        f"val_ks={val_metrics['ks']:.4f}"
+    )
+
+    if early_stopper.should_stop:
+
+        print(
+            f"Early stopping epoch {epoch}"
+        )
+
+        break
+
+
+# ============================================================
+# 32) RECUPERAR MEJOR MODELO
+# ============================================================
+
+if early_stopper.best_state is not None:
+
+    model2.load_state_dict(
+        early_stopper.best_state
+    )
+
+
+# ============================================================
+# 33) TEST
+# ============================================================
+
+(
+    test_metrics,
+    test_logits,
+    test_probs,
+    test_y_true
+
+) = evaluate_model(
+
+    model2,
+
+    test_loader,
+
+    criterion,
+
+    device
+)
+
+
+print(
+    "\nTEST:"
+)
+
+print(
+    test_metrics
+)
+
+
+# ============================================================
+# 34) ASOCIAR SCORE CON CUENTA Y BUSINESS_DATE
+#
+# MUY ÚTIL PARA VER LA TRAYECTORIA.
+# ============================================================
+
+test_scores = pd.DataFrame(
+
+    keys_test,
+
+    columns=[
+        "NUM_CUENTA",
+        "business_date"
+    ]
+)
+
+
+test_scores[
+    "target"
+] = test_y_true.astype(int)
+
+
+test_scores[
+    "score"
+] = test_probs
+
+
+test_scores = (
+
+    test_scores
+    .sort_values(
+        [
+            "NUM_CUENTA",
+            "business_date"
+        ]
+    )
+    .reset_index(drop=True)
+)
+
+
+print(
+    test_scores.head(20)
+)
+
+
+# ============================================================
+# 35) ROC
+# ============================================================
+
+fpr, tpr, _ = roc_curve(
+
+    test_y_true,
+
+    test_probs
+)
+
+
+roc_auc = roc_auc_score(
+
+    test_y_true,
+
+    test_probs
+)
+
+
+plt.figure(
+    figsize=(7, 5)
+)
+
+plt.plot(
+
+    fpr,
+
+    tpr,
+
+    label=(
+        f"ROC AUC = "
+        f"{roc_auc:.4f}"
+    )
+)
+
+plt.plot(
+
+    [0, 1],
+
+    [0, 1],
+
+    linestyle="--"
+)
+
+plt.xlabel(
+    "False Positive Rate"
+)
+
+plt.ylabel(
+    "True Positive Rate"
+)
+
+plt.title(
+    "ROC Curve - Test"
+)
+
+plt.legend()
+
+plt.show()
+
+
+# ============================================================
+# 36) GUARDAR ARTEFACTO COMPLETO
+# ============================================================
+
+def save_model_artifact(
+    model,
+    path
+):
+
+    """
+    Guarda no solamente pesos.
+
+    También todo lo necesario para reproducir EXACTAMENTE
+    el procesamiento de producción.
+    """
+
+    artifact = {
+
+        # ----------------------------------------------------
+        # MODELO
+        # ----------------------------------------------------
+
+        "model_state_dict":
+            model.state_dict(),
+
+        "model_config": {
+
+            "vocab_sizes":
+                vocab_sizes,
+
+            "emb_dims":
+                emb_dims,
+
+            "num_seq_features":
+                len(
+                    SEQ_NUM_COLS
+                ),
+
+            "num_static_features":
+                len(
+                    STATIC_FEATURE_NAMES
+                ),
+
+            "hidden_size":
+                64
+        },
+
+        # ----------------------------------------------------
+        # PREPROCESS
+        # ----------------------------------------------------
+
+        "preprocessing_params": {
+
+            "q01":
+                float(q01),
+
+            "q99":
+                float(q99),
+
+            "amount_bins":
+                CFG.amount_bins,
+
+            "max_seq_len":
+                CFG.max_seq_len,
+
+            "min_txn_history":
+                CFG.min_txn_history,
+
+            "top_categories":
+                top_categories
+        },
+
+        # ----------------------------------------------------
+        # VOCABULARIOS
+        # ----------------------------------------------------
+
+        "vocabs":
+            vocabs,
+
+        # ----------------------------------------------------
+        # SCALERS
+        # ----------------------------------------------------
+
+        "seq_scaler": {
+
+            "mean":
+                seq_scaler.mean_,
+
+            "scale":
+                seq_scaler.scale_
+        },
+
+        "static_scaler": {
+
+            "mean":
+                static_scaler.mean_,
+
+            "scale":
+                static_scaler.scale_
+        },
+
+        # ----------------------------------------------------
+        # FEATURES
+        # ----------------------------------------------------
+
+        "feature_names": {
+
+            "num_seq":
+                SEQ_NUM_COLS,
+
+            "cat_seq":
+                CAT_SEQ_COLS,
+
+            "static":
+                STATIC_FEATURE_NAMES
+        },
+
+        # ----------------------------------------------------
+        # TARGET
+        # ----------------------------------------------------
+
+        "target_definition": {
+
+            "name":
+                "target_A_entry_bad",
+
+            "horizon_months":
+                3,
+
+            "threshold_bad":
+                1,
+
+            "keep_only_before_first_bad":
+                True
+        },
+
+        # ----------------------------------------------------
+        # ENTORNO
+        # ----------------------------------------------------
+
+        "environment": {
+
+            "pytorch_version":
+                torch.__version__,
+
+            "pandas_version":
+                pd.__version__
+        }
+    }
+
+    torch.save(
+        artifact,
+        path
+    )
+
+    print(
+        f"Artefacto guardado en:\n{path}"
+    )
+
+
+# ============================================================
+# EJEMPLO
+# ============================================================
+
+# save_model_artifact(
+#
+#     model2,
+#
+#     path=r"C:\Users\s5095999\OneDrive - The Bank of Nova Scotia\Respaldos Privados\modelo.pth"
+# )
