@@ -1,0 +1,3695 @@
+
+
+# ============================================================
+# ============================================================
+# BANCO LATENTE DE REFERENCIA GRU
+#
+# OBJETIVOS
+#
+# 1. Construir clusters usando únicamente clientes sanos:
+#       target = 0
+#
+# 2. Guardar sus embeddings GRU.
+#
+# 3. Guardar embeddings contextuales de transacciones sanas.
+#
+# 4. Después poder cargar solamente:
+#
+#       embeddings
+#       metadata
+#       scaler
+#       clusters
+#
+#    SIN volver a cargar la base histórica pesada.
+#
+# 5. Para clientes nuevos:
+#
+#       GRU -> embedding
+#           -> cluster sano
+#           -> distancia al sano
+#           -> vecinos sanos similares
+#
+# 6. Para nuevas transacciones:
+#
+#       trx nueva
+#           -> estado GRU contextual
+#           -> cluster transaccional sano
+#           -> transacciones históricas similares
+#
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# 0) IMPORTS
+# ============================================================
+
+import os
+import gc
+import joblib
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+
+from torch.utils.data import DataLoader
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.neighbors import NearestNeighbors
+
+
+# ============================================================
+# 1) CONFIGURACIÓN
+# ============================================================
+
+REFERENCE_DIR = (
+    r"C:\Users\s5095999"
+    r"\OneDrive - The Bank of Nova Scotia"
+    r"\Respaldos Privados"
+    r"\GRU_REFERENCE"
+)
+
+
+os.makedirs(
+    REFERENCE_DIR,
+    exist_ok=True
+)
+
+
+# ------------------------------------------------------------
+# Clusters a nivel cliente/corte
+# ------------------------------------------------------------
+
+N_ACCOUNT_CLUSTERS = 8
+
+
+# ------------------------------------------------------------
+# Clusters a nivel transacción contextual
+# ------------------------------------------------------------
+
+N_TRANSACTION_CLUSTERS = 12
+
+
+# ------------------------------------------------------------
+# Para no guardar 100 transacciones de cada cliente sano.
+#
+# Guardamos, por ejemplo, las últimas 20 transacciones
+# anteriores al corte sano de referencia.
+#
+# Puedes subirlo posteriormente.
+# ------------------------------------------------------------
+
+MAX_REFERENCE_TX_PER_ACCOUNT = 20
+
+
+# ------------------------------------------------------------
+# Batch para extracción GRU
+# ------------------------------------------------------------
+
+EMBED_BATCH_SIZE = 512
+
+
+# ------------------------------------------------------------
+# Para construir el banco transaccional por bloques.
+#
+# Evita crear todas las secuencias event-driven
+# simultáneamente en RAM.
+# ------------------------------------------------------------
+
+EVENT_CHUNK_SIZE = 4096
+
+
+# ============================================================
+# COMPROBACIÓN
+# ============================================================
+
+if not hasattr(model2, "gru"):
+
+    raise ValueError(
+        "Este código espera que model2 tenga una capa "
+        "model2.gru."
+    )
+
+
+model2.eval()
+
+
+# ============================================================
+# ============================================================
+# PARTE A
+# EXTRAER REPRESENTACIÓN FINAL DE CUENTA × BUSINESS_DATE
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# 2) EXTRAER EMBEDDING FINAL GRU
+#
+# NO reentrena.
+#
+# Devuelve:
+#
+# embedding GRU
+# risk_score
+#
+# La representación GRU NO contiene todavía las variables
+# estáticas.
+#
+# Después usamos h + estáticas solamente para calcular
+# risk_score con el head ya entrenado.
+# ============================================================
+
+@torch.no_grad()
+def extract_account_embeddings(
+    model,
+    loader,
+    device
+):
+
+    model.eval()
+
+    embedding_blocks = []
+    score_blocks = []
+
+
+    for batch in loader:
+
+        batch = {
+
+            k:
+                v.to(device)
+
+            for k, v
+            in batch.items()
+        }
+
+
+        # ====================================================
+        # INPUT NUMÉRICO
+        # ====================================================
+
+        x_num = batch[
+            "x_num"
+        ]
+
+
+        x_static = batch[
+            "x_static"
+        ]
+
+
+        lengths = (
+            batch[
+                "length"
+            ]
+            .cpu()
+        )
+
+
+        # ====================================================
+        # EMBEDDINGS CATEGÓRICOS
+        # ====================================================
+
+        emb_list = []
+
+
+        for name in model.embeddings.keys():
+
+            emb = model.embeddings[
+                name
+            ](
+                batch[
+                    name
+                ]
+            )
+
+            emb_list.append(
+                emb
+            )
+
+
+        # ====================================================
+        # MISMA ENTRADA UTILIZADA DURANTE ENTRENAMIENTO
+        # ====================================================
+
+        x = torch.cat(
+
+            [x_num]
+            +
+            emb_list,
+
+            dim=-1
+        )
+
+
+        # ====================================================
+        # PACK
+        # ====================================================
+
+        packed = (
+            nn.utils.rnn
+            .pack_padded_sequence(
+
+                x,
+
+                lengths,
+
+                batch_first=True,
+
+                enforce_sorted=False
+            )
+        )
+
+
+        # ====================================================
+        # GRU
+        # ====================================================
+
+        _, h_n = model.gru(
+            packed
+        )
+
+
+        # ====================================================
+        # ÚLTIMA CAPA GRU
+        #
+        # Ejemplo:
+        #
+        # hidden_size = 32
+        #
+        # h.shape = [batch, 32]
+        # ====================================================
+
+        h = h_n[-1]
+
+
+        embedding_blocks.append(
+
+            h.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+
+
+        # ====================================================
+        # SCORE DEL MODELO
+        #
+        # Evitamos volver a ejecutar la GRU.
+        #
+        # Usamos directamente:
+        #
+        # h_GRU + estáticas -> head
+        # ====================================================
+
+        fused = torch.cat(
+
+            [
+                h,
+                x_static
+            ],
+
+            dim=-1
+        )
+
+
+        logits = (
+
+            model.head(
+                fused
+            )
+            .squeeze(1)
+        )
+
+
+        probs = torch.sigmoid(
+            logits
+        )
+
+
+        score_blocks.append(
+
+            probs.detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+
+
+    embeddings = np.concatenate(
+        embedding_blocks,
+        axis=0
+    )
+
+
+    scores = np.concatenate(
+        score_blocks,
+        axis=0
+    )
+
+
+    return (
+        embeddings,
+        scores
+    )
+
+
+# ============================================================
+# 3) METADATA TRAIN
+#
+# Esto supone que tienes:
+#
+# keys_train
+# y_train
+#
+# salidos de:
+#
+# build_samples(...)
+# ============================================================
+
+train_meta = pd.DataFrame(
+
+    keys_train,
+
+    columns=[
+        "NUM_CUENTA",
+        "business_date"
+    ]
+)
+
+
+train_meta[
+    "target"
+] = (
+    np.asarray(
+        y_train
+    )
+    .astype(int)
+)
+
+
+train_meta[
+    "original_idx"
+] = np.arange(
+    len(train_meta)
+)
+
+
+# ============================================================
+# 4) QUEDARNOS SOLAMENTE CON SANOS
+#
+# target = 0
+#
+# CURRENT en t+3
+# ============================================================
+
+healthy_meta = (
+
+    train_meta[
+        train_meta[
+            "target"
+        ]
+        ==
+        0
+    ]
+    .copy()
+)
+
+
+# ============================================================
+# IMPORTANTE
+#
+# Como el mismo cliente puede aparecer muchos meses,
+# para el banco de referencia tomamos inicialmente
+# UN SOLO CORTE POR CUENTA:
+#
+# el último corte sano disponible.
+#
+# Así un cliente con 10 meses no pesa 10 veces más
+# que otro cliente.
+# ============================================================
+
+healthy_meta = (
+
+    healthy_meta
+
+    .sort_values(
+        [
+            "NUM_CUENTA",
+            "business_date"
+        ]
+    )
+
+    .groupby(
+        "NUM_CUENTA",
+        as_index=False
+    )
+
+    .tail(1)
+
+    .reset_index(
+        drop=True
+    )
+)
+
+
+healthy_idx = (
+
+    healthy_meta[
+        "original_idx"
+    ]
+    .to_numpy()
+)
+
+
+print(
+    "Clientes sanos de referencia:",
+    len(healthy_meta)
+)
+
+
+# ============================================================
+# 5) EXTRAER ARRAYS DE ESOS CLIENTES
+# ============================================================
+
+X_num_ref = (
+    X_num_train[
+        healthy_idx
+    ]
+)
+
+
+X_cat_ref = {
+
+    col:
+        X_cat_train[
+            col
+        ][
+            healthy_idx
+        ]
+
+    for col
+    in CAT_SEQ_COLS
+}
+
+
+X_static_ref = (
+    X_static_train[
+        healthy_idx
+    ]
+)
+
+
+y_ref = (
+    np.asarray(
+        y_train
+    )[
+        healthy_idx
+    ]
+)
+
+
+len_ref = (
+    np.asarray(
+        len_train
+    )[
+        healthy_idx
+    ]
+)
+
+
+# ============================================================
+# 6) DATASET REFERENCIA
+# ============================================================
+
+ref_dataset = AccountSequenceDataset(
+
+    X_num_ref,
+
+    X_cat_ref,
+
+    X_static_ref,
+
+    y_ref,
+
+    len_ref
+)
+
+
+ref_loader = DataLoader(
+
+    ref_dataset,
+
+    batch_size=
+        EMBED_BATCH_SIZE,
+
+    shuffle=False
+)
+
+
+# ============================================================
+# 7) PROYECTAR SANOS EN ESPACIO GRU
+# ============================================================
+
+healthy_account_embeddings, healthy_account_scores = (
+    extract_account_embeddings(
+
+        model2,
+
+        ref_loader,
+
+        device
+    )
+)
+
+
+print(
+    "\nEmbedding clientes sanos:"
+)
+
+print(
+    healthy_account_embeddings.shape
+)
+
+
+# ============================================================
+# 8) CREAR CLUSTERING SANO A NIVEL CLIENTE
+# ============================================================
+
+account_scaler = StandardScaler()
+
+
+Z_account_ref = (
+    account_scaler
+    .fit_transform(
+        healthy_account_embeddings
+    )
+    .astype(np.float32)
+)
+
+
+# ============================================================
+# MiniBatchKMeans
+#
+# Más adecuado si tienes cientos de miles de clientes.
+# ============================================================
+
+account_kmeans = MiniBatchKMeans(
+
+    n_clusters=
+        N_ACCOUNT_CLUSTERS,
+
+    random_state=
+        42,
+
+    batch_size=
+        4096,
+
+    n_init=
+        10
+)
+
+
+healthy_account_cluster = (
+    account_kmeans
+    .fit_predict(
+        Z_account_ref
+    )
+)
+
+
+# ============================================================
+# 9) DISTANCIA AL CENTRO SANO
+# ============================================================
+
+account_centers = (
+
+    account_kmeans
+    .cluster_centers_[
+        healthy_account_cluster
+    ]
+)
+
+
+healthy_account_distance = np.linalg.norm(
+
+    Z_account_ref
+    -
+    account_centers,
+
+    axis=1
+)
+
+
+# ============================================================
+# 10) METADATA FINAL DE REFERENCIA
+# ============================================================
+
+healthy_account_meta = (
+    healthy_meta.copy()
+)
+
+
+healthy_account_meta[
+    "cluster"
+] = (
+    healthy_account_cluster
+)
+
+
+healthy_account_meta[
+    "distance_to_centroid"
+] = (
+    healthy_account_distance
+)
+
+
+healthy_account_meta[
+    "risk_score"
+] = (
+    healthy_account_scores
+)
+
+
+# ============================================================
+# 11) ESTADÍSTICAS DE DISTANCIA POR CLUSTER
+#
+# Esto nos permite posteriormente saber si un cliente nuevo
+# está excepcionalmente lejos de los sanos de ese cluster.
+# ============================================================
+
+account_cluster_stats = (
+
+    healthy_account_meta
+
+    .groupby(
+        "cluster"
+    )[
+        "distance_to_centroid"
+    ]
+
+    .agg(
+
+        n="size",
+
+        median="median",
+
+        mean="mean",
+
+        std="std",
+
+        p90=lambda x:
+            x.quantile(0.90),
+
+        p95=lambda x:
+            x.quantile(0.95),
+
+        p99=lambda x:
+            x.quantile(0.99)
+    )
+
+    .reset_index()
+)
+
+
+print(
+    "\nClusters de clientes sanos:"
+)
+
+print(
+    account_cluster_stats
+)
+
+
+# ============================================================
+# 12) GUARDAR BANCO A NIVEL CLIENTE
+# ============================================================
+
+np.save(
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_account_embeddings.npy"
+    ),
+
+    healthy_account_embeddings.astype(
+        np.float32
+    )
+)
+
+
+healthy_account_meta.to_pickle(
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_account_metadata.pkl"
+    )
+)
+
+
+account_cluster_stats.to_pickle(
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_account_cluster_stats.pkl"
+    )
+)
+
+
+joblib.dump(
+
+    account_scaler,
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_account_scaler.joblib"
+    )
+)
+
+
+joblib.dump(
+
+    account_kmeans,
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_account_kmeans.joblib"
+    )
+)
+
+
+print(
+    "\nBanco de clientes sanos guardado."
+)
+
+
+# ============================================================
+# ============================================================
+# PARTE B
+# EMBEDDINGS CONTEXTUALES DE TRANSACCIONES SANAS
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# 13) FUNCIÓN PARA EMBEBER UN CHUNK DE SECUENCIAS
+#
+# Aquí NO usamos estáticas.
+#
+# Sólo queremos:
+#
+# historial transaccional
+#        ↓
+# GRU
+#        ↓
+# h contextual
+# ============================================================
+
+@torch.no_grad()
+def embed_event_chunk(
+    num_sequences,
+    cat_sequences,
+    model,
+    device
+):
+
+    if len(num_sequences) == 0:
+
+        return np.empty(
+            (
+                0,
+                model.gru.hidden_size
+            ),
+            dtype=np.float32
+        )
+
+
+    # ========================================================
+    # PADDING
+    # ========================================================
+
+    X_num, lengths = pad_num_sequences(
+
+        num_sequences,
+
+        CFG.max_seq_len,
+
+        len(
+            SEQ_NUM_COLS
+        )
+    )
+
+
+    X_cat = {
+
+        col:
+            pad_cat_sequences(
+
+                cat_sequences[
+                    col
+                ],
+
+                CFG.max_seq_len
+            )
+
+        for col
+        in CAT_SEQ_COLS
+    }
+
+
+    # ========================================================
+    # TENSORES
+    # ========================================================
+
+    x_num = torch.tensor(
+
+        X_num,
+
+        dtype=torch.float32,
+
+        device=device
+    )
+
+
+    lengths_t = torch.tensor(
+
+        lengths,
+
+        dtype=torch.long
+    )
+
+
+    emb_list = []
+
+
+    for col in CAT_SEQ_COLS:
+
+        x_cat = torch.tensor(
+
+            X_cat[
+                col
+            ],
+
+            dtype=torch.long,
+
+            device=device
+        )
+
+
+        emb = model.embeddings[
+            col
+        ](
+            x_cat
+        )
+
+
+        emb_list.append(
+            emb
+        )
+
+
+    # ========================================================
+    # INPUT GRU
+    # ========================================================
+
+    x = torch.cat(
+
+        [x_num]
+        +
+        emb_list,
+
+        dim=-1
+    )
+
+
+    packed = (
+        nn.utils.rnn
+        .pack_padded_sequence(
+
+            x,
+
+            lengths_t,
+
+            batch_first=True,
+
+            enforce_sorted=False
+        )
+    )
+
+
+    _, h_n = model.gru(
+        packed
+    )
+
+
+    h = h_n[-1]
+
+
+    return (
+
+        h.detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+
+# ============================================================
+# 14) CONSTRUIR BANCO DE TRANSACCIONES SANAS
+#
+# IMPORTANTE:
+#
+# trx_score debe ser la base transaccional YA PROCESADA,
+# es decir debe contener:
+#
+# amount_log
+# delta_days
+# day_of_week
+# is_weekend
+#
+# giro_r
+# merchant_r
+# city_r
+# giro_city_r
+# giro_amount_bin_r
+#
+# Igual que la que utilizaste para build_samples().
+# ============================================================
+
+def build_healthy_transaction_bank(
+
+    healthy_account_meta,
+
+    trx_score,
+
+    model,
+
+    vocabs,
+
+    device,
+
+    max_events_per_account=20,
+
+    chunk_size=4096
+
+):
+
+    # ========================================================
+    # VERIFICAR COLUMNAS
+    # ========================================================
+
+    required_cols = (
+
+        [
+            "NUM_CUENTA",
+            "txn_date",
+            "auth_amt"
+        ]
+
+        +
+
+        SEQ_NUM_COLS[:-1]
+
+        +
+
+        CAT_SEQ_COLS
+    )
+
+
+    required_cols = list(
+        dict.fromkeys(
+            required_cols
+        )
+    )
+
+
+    missing = [
+
+        c
+        for c in required_cols
+        if c not in trx_score.columns
+    ]
+
+
+    if missing:
+
+        raise ValueError(
+            f"Faltan columnas en trx_score: {missing}"
+        )
+
+
+    # ========================================================
+    # TRANSACCIONES AGRUPADAS
+    # ========================================================
+
+    grouped_trx = (
+
+        trx_score
+
+        .sort_values(
+            [
+                "NUM_CUENTA",
+                "txn_date"
+            ]
+        )
+
+        .groupby(
+            "NUM_CUENTA",
+            sort=False
+        )
+    )
+
+
+    # ========================================================
+    # BUFFERS
+    # ========================================================
+
+    num_buffer = []
+
+
+    cat_buffer = {
+
+        col: []
+
+        for col
+        in CAT_SEQ_COLS
+    }
+
+
+    metadata_rows = []
+
+
+    embedding_blocks = []
+
+
+    # ========================================================
+    # RECORRER CLIENTES SANOS
+    # ========================================================
+
+    for ref_row in healthy_account_meta.itertuples(
+        index=False
+    ):
+
+        account = str(
+            ref_row.NUM_CUENTA
+        )
+
+
+        if account not in grouped_trx.groups:
+            continue
+
+
+        business_date = pd.Timestamp(
+            ref_row.business_date
+        )
+
+
+        g = (
+
+            grouped_trx
+
+            .get_group(
+                account
+            )
+
+            .sort_values(
+                "txn_date"
+            )
+
+            .copy()
+        )
+
+
+        # ====================================================
+        # SÓLO INFORMACIÓN CONOCIDA EN EL CORTE SANO
+        # ====================================================
+
+        cutoff_exclusive = (
+
+            business_date.normalize()
+
+            +
+
+            pd.Timedelta(
+                days=1
+            )
+        )
+
+
+        g = (
+
+            g[
+                g[
+                    "txn_date"
+                ]
+                <
+                cutoff_exclusive
+            ]
+
+            .copy()
+        )
+
+
+        if (
+            len(g)
+            <
+            CFG.min_txn_history
+        ):
+
+            continue
+
+
+        # ====================================================
+        # QUÉ EVENTOS VAMOS A GUARDAR
+        #
+        # Sólo las últimas N trx de cada cuenta.
+        # ====================================================
+
+        start_pos = max(
+
+            CFG.min_txn_history - 1,
+
+            len(g)
+            -
+            max_events_per_account
+        )
+
+
+        # ====================================================
+        # CADA TRANSACCIÓN GENERA UN ESTADO GRU
+        # ====================================================
+
+        for pos in range(
+            start_pos,
+            len(g)
+        ):
+
+            current_tx = (
+                g.iloc[
+                    pos
+                ]
+            )
+
+
+            event_asof = pd.Timestamp(
+                current_tx[
+                    "txn_date"
+                ]
+            )
+
+
+            # =================================================
+            # HISTORIA HASTA ESTA TRANSACCIÓN
+            # =================================================
+
+            hist = (
+
+                g.iloc[
+                    : pos + 1
+                ]
+
+                .tail(
+                    CFG.max_seq_len
+                )
+
+                .copy()
+            )
+
+
+            # =================================================
+            # MUY IMPORTANTE
+            #
+            # Para monitoreo transacción por transacción:
+            #
+            # days_to_asof se recalcula contra ESTA
+            # transacción, no contra el business_date mensual.
+            #
+            # La trx actual queda con:
+            #
+            # days_to_asof = 0
+            # =================================================
+
+            hist[
+                "days_to_asof"
+            ] = (
+
+                (
+                    event_asof
+
+                    -
+
+                    hist[
+                        "txn_date"
+                    ]
+                )
+
+                .dt
+                .total_seconds()
+
+                /
+
+                86400.0
+            )
+
+
+            hist[
+                "days_to_asof"
+            ] = (
+
+                hist[
+                    "days_to_asof"
+                ]
+
+                .clip(
+                    lower=0
+                )
+
+                .astype(
+                    np.float32
+                )
+            )
+
+
+            # =================================================
+            # SECUENCIA NUMÉRICA
+            # =================================================
+
+            seq_num = (
+
+                hist[
+                    SEQ_NUM_COLS
+                ]
+
+                .to_numpy(
+                    dtype=np.float32
+                )
+            )
+
+
+            num_buffer.append(
+                seq_num
+            )
+
+
+            # =================================================
+            # CATEGÓRICAS
+            # =================================================
+
+            for col in CAT_SEQ_COLS:
+
+                ids = (
+
+                    hist[
+                        col
+                    ]
+
+                    .astype(str)
+
+                    .map(
+
+                        lambda x:
+
+                            vocabs[
+                                col
+                            ].get(
+
+                                x,
+
+                                vocabs[
+                                    col
+                                ][
+                                    "<UNK>"
+                                ]
+                            )
+                    )
+
+                    .to_numpy(
+                        dtype=np.int64
+                    )
+                )
+
+
+                cat_buffer[
+                    col
+                ].append(
+                    ids
+                )
+
+
+            # =================================================
+            # METADATA
+            # =================================================
+
+            metadata_rows.append({
+
+                "NUM_CUENTA":
+                    account,
+
+                "reference_business_date":
+                    business_date,
+
+                "txn_date":
+                    current_tx[
+                        "txn_date"
+                    ],
+
+                "auth_amt":
+                    current_tx.get(
+                        "auth_amt",
+                        np.nan
+                    ),
+
+                "giro":
+                    current_tx.get(
+                        "giro",
+                        None
+                    ),
+
+                "giro_r":
+                    current_tx.get(
+                        "giro_r",
+                        None
+                    ),
+
+                "merchant":
+                    current_tx.get(
+                        "merchant",
+                        None
+                    ),
+
+                "merchant_r":
+                    current_tx.get(
+                        "merchant_r",
+                        None
+                    ),
+
+                "city":
+                    current_tx.get(
+                        "city",
+                        None
+                    ),
+
+                "city_r":
+                    current_tx.get(
+                        "city_r",
+                        None
+                    ),
+
+                "healthy_account_cluster":
+                    ref_row.cluster,
+
+                "sequence_length":
+                    len(hist)
+            })
+
+
+            # =================================================
+            # FLUSH DEL CHUNK
+            # =================================================
+
+            if (
+                len(
+                    num_buffer
+                )
+                >=
+                chunk_size
+            ):
+
+                emb_chunk = embed_event_chunk(
+
+                    num_buffer,
+
+                    cat_buffer,
+
+                    model,
+
+                    device
+                )
+
+
+                embedding_blocks.append(
+                    emb_chunk
+                )
+
+
+                # ---------------------------------------------
+                # Vaciar buffers
+                # ---------------------------------------------
+
+                num_buffer = []
+
+
+                cat_buffer = {
+
+                    col: []
+
+                    for col
+                    in CAT_SEQ_COLS
+                }
+
+
+    # ========================================================
+    # ÚLTIMO CHUNK
+    # ========================================================
+
+    if len(
+        num_buffer
+    ) > 0:
+
+        emb_chunk = embed_event_chunk(
+
+            num_buffer,
+
+            cat_buffer,
+
+            model,
+
+            device
+        )
+
+
+        embedding_blocks.append(
+            emb_chunk
+        )
+
+
+    # ========================================================
+    # CONCATENAR
+    # ========================================================
+
+    if len(
+        embedding_blocks
+    ) == 0:
+
+        raise ValueError(
+            "No se generaron embeddings transaccionales."
+        )
+
+
+    embeddings = np.concatenate(
+
+        embedding_blocks,
+
+        axis=0
+    )
+
+
+    metadata = pd.DataFrame(
+        metadata_rows
+    )
+
+
+    if (
+        len(metadata)
+        !=
+        len(embeddings)
+    ):
+
+        raise ValueError(
+            "Metadata y embeddings transaccionales "
+            "quedaron desalineados."
+        )
+
+
+    return (
+        embeddings,
+        metadata
+    )
+
+
+# ============================================================
+# 15) GENERAR BANCO TRANSACCIONAL
+#
+# ESTA PARTE ES PESADA PERO SE HACE UNA SOLA VEZ.
+# ============================================================
+
+healthy_tx_embeddings, healthy_tx_meta = (
+    build_healthy_transaction_bank(
+
+        healthy_account_meta=
+            healthy_account_meta,
+
+        trx_score=
+            trx_score,
+
+        model=
+            model2,
+
+        vocabs=
+            vocabs,
+
+        device=
+            device,
+
+        max_events_per_account=
+            MAX_REFERENCE_TX_PER_ACCOUNT,
+
+        chunk_size=
+            EVENT_CHUNK_SIZE
+    )
+)
+
+
+print(
+    "\nEmbeddings transacciones sanas:"
+)
+
+print(
+    healthy_tx_embeddings.shape
+)
+
+
+# ============================================================
+# 16) CLUSTERING TRANSACCIONAL SANO
+# ============================================================
+
+transaction_scaler = (
+    StandardScaler()
+)
+
+
+Z_tx_ref = (
+
+    transaction_scaler
+
+    .fit_transform(
+        healthy_tx_embeddings
+    )
+
+    .astype(
+        np.float32
+    )
+)
+
+
+transaction_kmeans = MiniBatchKMeans(
+
+    n_clusters=
+        N_TRANSACTION_CLUSTERS,
+
+    random_state=
+        42,
+
+    batch_size=
+        4096,
+
+    n_init=
+        10
+)
+
+
+healthy_tx_cluster = (
+
+    transaction_kmeans
+
+    .fit_predict(
+        Z_tx_ref
+    )
+)
+
+
+# ============================================================
+# 17) DISTANCIA AL CENTRO TRANSACCIONAL SANO
+# ============================================================
+
+tx_centers = (
+
+    transaction_kmeans
+    .cluster_centers_[
+        healthy_tx_cluster
+    ]
+)
+
+
+healthy_tx_distance = np.linalg.norm(
+
+    Z_tx_ref
+    -
+    tx_centers,
+
+    axis=1
+)
+
+
+healthy_tx_meta[
+    "tx_cluster"
+] = (
+    healthy_tx_cluster
+)
+
+
+healthy_tx_meta[
+    "distance_to_tx_centroid"
+] = (
+    healthy_tx_distance
+)
+
+
+# ============================================================
+# 18) ESTADÍSTICAS POR CLUSTER TRANSACCIONAL
+# ============================================================
+
+transaction_cluster_stats = (
+
+    healthy_tx_meta
+
+    .groupby(
+        "tx_cluster"
+    )[
+        "distance_to_tx_centroid"
+    ]
+
+    .agg(
+
+        n="size",
+
+        median="median",
+
+        mean="mean",
+
+        std="std",
+
+        p90=lambda x:
+            x.quantile(0.90),
+
+        p95=lambda x:
+            x.quantile(0.95),
+
+        p99=lambda x:
+            x.quantile(0.99)
+    )
+
+    .reset_index()
+)
+
+
+print(
+    "\nClusters transaccionales sanos:"
+)
+
+print(
+    transaction_cluster_stats
+)
+
+
+# ============================================================
+# 19) GUARDAR BANCO TRANSACCIONAL
+# ============================================================
+
+np.save(
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_transaction_embeddings.npy"
+    ),
+
+    healthy_tx_embeddings.astype(
+        np.float32
+    )
+)
+
+
+healthy_tx_meta.to_pickle(
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_transaction_metadata.pkl"
+    )
+)
+
+
+transaction_cluster_stats.to_pickle(
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_transaction_cluster_stats.pkl"
+    )
+)
+
+
+joblib.dump(
+
+    transaction_scaler,
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_transaction_scaler.joblib"
+    )
+)
+
+
+joblib.dump(
+
+    transaction_kmeans,
+
+    os.path.join(
+        REFERENCE_DIR,
+        "healthy_transaction_kmeans.joblib"
+    )
+)
+
+
+# ============================================================
+# 20) CONFIG DEL BANCO
+# ============================================================
+
+reference_config = {
+
+    "gru_hidden_size":
+        int(
+            healthy_account_embeddings.shape[1]
+        ),
+
+    "account_clusters":
+        N_ACCOUNT_CLUSTERS,
+
+    "transaction_clusters":
+        N_TRANSACTION_CLUSTERS,
+
+    "max_reference_tx_per_account":
+        MAX_REFERENCE_TX_PER_ACCOUNT,
+
+    "seq_num_cols":
+        list(
+            SEQ_NUM_COLS
+        ),
+
+    "cat_seq_cols":
+        list(
+            CAT_SEQ_COLS
+        ),
+
+    "static_features":
+        list(
+            STATIC_FEATURES
+        ),
+
+    "max_seq_len":
+        CFG.max_seq_len,
+
+    "min_txn_history":
+        CFG.min_txn_history
+}
+
+
+joblib.dump(
+
+    reference_config,
+
+    os.path.join(
+        REFERENCE_DIR,
+        "reference_config.joblib"
+    )
+)
+
+
+print(
+    "\n======================================="
+)
+
+print(
+    "BANCO DE REFERENCIA TERMINADO"
+)
+
+print(
+    "======================================="
+)
+
+
+print(
+    "Ruta:",
+    REFERENCE_DIR
+)
+
+
+# ============================================================
+# OPCIONAL:
+# LIBERAR BASES PESADAS DESPUÉS DE CREAR REFERENCIA
+# ============================================================
+
+del X_num_ref
+del X_cat_ref
+del X_static_ref
+del y_ref
+del len_ref
+del ref_dataset
+del ref_loader
+
+del Z_account_ref
+del Z_tx_ref
+
+
+gc.collect()
+
+
+if torch.cuda.is_available():
+
+    torch.cuda.empty_cache()
+
+
+# ============================================================
+# ============================================================
+# PARTE C
+# CARGAR BANCO DE REFERENCIA EN EL FUTURO
+#
+# YA NO NECESITAS CARGAR EL HISTÓRICO PESADO
+# ============================================================
+# ============================================================
+
+
+def load_reference_bank(
+    reference_dir
+):
+
+    # ========================================================
+    # CLIENTES
+    # ========================================================
+
+    account_embeddings = np.load(
+
+        os.path.join(
+            reference_dir,
+            "healthy_account_embeddings.npy"
+        ),
+
+        mmap_mode="r"
+    )
+
+
+    account_meta = pd.read_pickle(
+
+        os.path.join(
+            reference_dir,
+            "healthy_account_metadata.pkl"
+        )
+    )
+
+
+    account_stats = pd.read_pickle(
+
+        os.path.join(
+            reference_dir,
+            "healthy_account_cluster_stats.pkl"
+        )
+    )
+
+
+    account_scaler = joblib.load(
+
+        os.path.join(
+            reference_dir,
+            "healthy_account_scaler.joblib"
+        )
+    )
+
+
+    account_kmeans = joblib.load(
+
+        os.path.join(
+            reference_dir,
+            "healthy_account_kmeans.joblib"
+        )
+    )
+
+
+    # ========================================================
+    # TRANSACCIONES
+    # ========================================================
+
+    tx_embeddings = np.load(
+
+        os.path.join(
+            reference_dir,
+            "healthy_transaction_embeddings.npy"
+        ),
+
+        mmap_mode="r"
+    )
+
+
+    tx_meta = pd.read_pickle(
+
+        os.path.join(
+            reference_dir,
+            "healthy_transaction_metadata.pkl"
+        )
+    )
+
+
+    tx_stats = pd.read_pickle(
+
+        os.path.join(
+            reference_dir,
+            "healthy_transaction_cluster_stats.pkl"
+        )
+    )
+
+
+    tx_scaler = joblib.load(
+
+        os.path.join(
+            reference_dir,
+            "healthy_transaction_scaler.joblib"
+        )
+    )
+
+
+    tx_kmeans = joblib.load(
+
+        os.path.join(
+            reference_dir,
+            "healthy_transaction_kmeans.joblib"
+        )
+    )
+
+
+    config = joblib.load(
+
+        os.path.join(
+            reference_dir,
+            "reference_config.joblib"
+        )
+    )
+
+
+    # ========================================================
+    # ÍNDICES DE SIMILITUD
+    #
+    # NO requieren la base original.
+    #
+    # Sólo los embeddings guardados.
+    # ========================================================
+
+    nn_accounts = NearestNeighbors(
+
+        metric="cosine",
+
+        algorithm="brute"
+    )
+
+
+    nn_accounts.fit(
+        account_embeddings
+    )
+
+
+    nn_transactions = NearestNeighbors(
+
+        metric="cosine",
+
+        algorithm="brute"
+    )
+
+
+    nn_transactions.fit(
+        tx_embeddings
+    )
+
+
+    return {
+
+        "account_embeddings":
+            account_embeddings,
+
+        "account_meta":
+            account_meta,
+
+        "account_stats":
+            account_stats,
+
+        "account_scaler":
+            account_scaler,
+
+        "account_kmeans":
+            account_kmeans,
+
+        "nn_accounts":
+            nn_accounts,
+
+        "tx_embeddings":
+            tx_embeddings,
+
+        "tx_meta":
+            tx_meta,
+
+        "tx_stats":
+            tx_stats,
+
+        "tx_scaler":
+            tx_scaler,
+
+        "tx_kmeans":
+            tx_kmeans,
+
+        "nn_transactions":
+            nn_transactions,
+
+        "config":
+            config
+    }
+
+
+# ============================================================
+# 21) CARGAR BANCO
+# ============================================================
+
+reference_bank = load_reference_bank(
+    REFERENCE_DIR
+)
+
+
+print(
+    "\nBanco cargado:"
+)
+
+
+print(
+    "Clientes:",
+    reference_bank[
+        "account_embeddings"
+    ].shape
+)
+
+
+print(
+    "Transacciones:",
+    reference_bank[
+        "tx_embeddings"
+    ].shape
+)
+
+
+# ============================================================
+# ============================================================
+# PARTE D
+# PROYECTAR NUEVOS CLIENTES
+#
+# SUPONEMOS QUE YA HICISTE:
+#
+# (
+#     X_num_new,
+#     X_cat_new,
+#     X_static_new,
+#     y_dummy_new,
+#     len_new,
+#     keys_new
+#
+# ) = build_samples(
+#
+#     cartera_score,
+#     trx_score_nueva,
+#     vocabs,
+#     target_col="target_dummy"
+# )
+#
+# ============================================================
+# ============================================================
+
+
+def project_new_accounts(
+
+    X_num_new,
+
+    X_cat_new,
+
+    X_static_new,
+
+    len_new,
+
+    keys_new,
+
+    model,
+
+    reference_bank,
+
+    device,
+
+    batch_size=512
+
+):
+
+    # ========================================================
+    # TARGET DUMMY
+    # ========================================================
+
+    y_dummy = np.zeros(
+
+        len(
+            X_num_new
+        ),
+
+        dtype=np.float32
+    )
+
+
+    # ========================================================
+    # DATASET
+    # ========================================================
+
+    dataset = AccountSequenceDataset(
+
+        X_num_new,
+
+        X_cat_new,
+
+        X_static_new,
+
+        y_dummy,
+
+        len_new
+    )
+
+
+    loader = DataLoader(
+
+        dataset,
+
+        batch_size=
+            batch_size,
+
+        shuffle=False
+    )
+
+
+    # ========================================================
+    # GRU PROJECTION
+    # ========================================================
+
+    embeddings, scores = (
+        extract_account_embeddings(
+
+            model,
+
+            loader,
+
+            device
+        )
+    )
+
+
+    # ========================================================
+    # MISMO SCALER SANO
+    # ========================================================
+
+    Z = (
+
+        reference_bank[
+            "account_scaler"
+        ]
+
+        .transform(
+            embeddings
+        )
+
+        .astype(
+            np.float32
+        )
+    )
+
+
+    # ========================================================
+    # ASIGNACIÓN CLUSTER
+    # ========================================================
+
+    clusters = (
+
+        reference_bank[
+            "account_kmeans"
+        ]
+
+        .predict(
+            Z
+        )
+    )
+
+
+    # ========================================================
+    # DISTANCIA AL CENTRO
+    # ========================================================
+
+    centers = (
+
+        reference_bank[
+            "account_kmeans"
+        ]
+
+        .cluster_centers_[
+            clusters
+        ]
+    )
+
+
+    distances = np.linalg.norm(
+
+        Z
+        -
+        centers,
+
+        axis=1
+    )
+
+
+    # ========================================================
+    # TABLA
+    # ========================================================
+
+    projection = pd.DataFrame(
+
+        keys_new,
+
+        columns=[
+            "NUM_CUENTA",
+            "business_date"
+        ]
+    )
+
+
+    projection[
+        "risk_score"
+    ] = scores
+
+
+    projection[
+        "healthy_cluster"
+    ] = clusters
+
+
+    projection[
+        "distance_to_healthy_centroid"
+    ] = distances
+
+
+    # ========================================================
+    # COMPARAR CONTRA P95 DEL CLUSTER SANO
+    # ========================================================
+
+    stats = (
+
+        reference_bank[
+            "account_stats"
+        ][
+            [
+                "cluster",
+                "p95",
+                "p99"
+            ]
+        ]
+
+        .rename(
+            columns={
+
+                "cluster":
+                    "healthy_cluster",
+
+                "p95":
+                    "healthy_distance_p95",
+
+                "p99":
+                    "healthy_distance_p99"
+            }
+        )
+    )
+
+
+    projection = projection.merge(
+
+        stats,
+
+        on="healthy_cluster",
+
+        how="left"
+    )
+
+
+    projection[
+        "outside_healthy_p95"
+    ] = (
+
+        projection[
+            "distance_to_healthy_centroid"
+        ]
+
+        >
+
+        projection[
+            "healthy_distance_p95"
+        ]
+    ).astype(int)
+
+
+    projection[
+        "outside_healthy_p99"
+    ] = (
+
+        projection[
+            "distance_to_healthy_centroid"
+        ]
+
+        >
+
+        projection[
+            "healthy_distance_p99"
+        ]
+    ).astype(int)
+
+
+    # ========================================================
+    # RATIO DISTANCIA / P95
+    #
+    # > 1 significa que está fuera del 95% típico
+    # de ese cluster sano.
+    # ========================================================
+
+    projection[
+        "distance_vs_p95"
+    ] = (
+
+        projection[
+            "distance_to_healthy_centroid"
+        ]
+
+        /
+
+        projection[
+            "healthy_distance_p95"
+        ]
+    )
+
+
+    return (
+        embeddings,
+        projection
+    )
+
+
+# ============================================================
+# EJEMPLO NUEVOS CLIENTES
+# ============================================================
+
+# new_account_embeddings, new_projection = (
+#
+#     project_new_accounts(
+#
+#         X_num_new=
+#             X_num_new,
+#
+#         X_cat_new=
+#             X_cat_new,
+#
+#         X_static_new=
+#             X_static_new,
+#
+#         len_new=
+#             len_new,
+#
+#         keys_new=
+#             keys_new,
+#
+#         model=
+#             model2,
+#
+#         reference_bank=
+#             reference_bank,
+#
+#         device=
+#             device
+#     )
+# )
+
+
+# ============================================================
+# ============================================================
+# PARTE E
+# BUSCAR CLIENTES SANOS SIMILARES
+# ============================================================
+# ============================================================
+
+
+def find_similar_healthy_accounts(
+
+    query_idx,
+
+    new_embeddings,
+
+    new_projection,
+
+    reference_bank,
+
+    k=10
+
+):
+
+    if query_idx < 0:
+
+        query_idx = (
+            len(
+                new_embeddings
+            )
+            +
+            query_idx
+        )
+
+
+    query = (
+
+        new_embeddings[
+            query_idx
+        ]
+
+        .reshape(
+            1,
+            -1
+        )
+    )
+
+
+    n_neighbors = min(
+
+        k,
+
+        len(
+            reference_bank[
+                "account_meta"
+            ]
+        )
+    )
+
+
+    distances, indices = (
+
+        reference_bank[
+            "nn_accounts"
+        ]
+
+        .kneighbors(
+
+            query,
+
+            n_neighbors=
+                n_neighbors
+        )
+    )
+
+
+    neighbors = (
+
+        reference_bank[
+            "account_meta"
+        ]
+
+        .iloc[
+            indices[0]
+        ]
+
+        .copy()
+
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+    neighbors[
+        "cosine_distance"
+    ] = distances[0]
+
+
+    neighbors[
+        "similarity"
+    ] = (
+
+        1.0
+
+        -
+
+        distances[0]
+    )
+
+
+    query_info = (
+
+        new_projection
+
+        .iloc[
+            [
+                query_idx
+            ]
+        ]
+
+        .copy()
+    )
+
+
+    return (
+        query_info,
+        neighbors
+    )
+
+
+# ============================================================
+# EJEMPLO
+# ============================================================
+
+# query_cliente, similares_cliente = (
+#
+#     find_similar_healthy_accounts(
+#
+#         query_idx=0,
+#
+#         new_embeddings=
+#             new_account_embeddings,
+#
+#         new_projection=
+#             new_projection,
+#
+#         reference_bank=
+#             reference_bank,
+#
+#         k=10
+#     )
+# )
+#
+#
+# print(
+#     query_cliente
+# )
+#
+#
+# print(
+#     similares_cliente[
+#         [
+#             "NUM_CUENTA",
+#             "business_date",
+#             "cluster",
+#             "risk_score",
+#             "distance_to_centroid",
+#             "similarity"
+#         ]
+#     ]
+# )
+
+
+# ============================================================
+# ============================================================
+# PARTE F
+# PROYECTAR NUEVAS TRANSACCIONES
+#
+# IMPORTANTE:
+#
+# trx_new debe estar PREPROCESADA exactamente igual
+# que trx_score del entrenamiento.
+#
+# No necesita contener toda tu base histórica.
+#
+# Sólo necesitas la historia transaccional del cliente
+# que estás analizando.
+# ============================================================
+# ============================================================
+
+
+def project_new_transaction_states(
+
+    trx_new,
+
+    model,
+
+    vocabs,
+
+    device,
+
+    max_events_per_account=None,
+
+    chunk_size=2048
+
+):
+
+    grouped_trx = (
+
+        trx_new
+
+        .sort_values(
+            [
+                "NUM_CUENTA",
+                "txn_date"
+            ]
+        )
+
+        .groupby(
+            "NUM_CUENTA",
+            sort=False
+        )
+    )
+
+
+    num_buffer = []
+
+
+    cat_buffer = {
+
+        col: []
+
+        for col
+        in CAT_SEQ_COLS
+    }
+
+
+    metadata_rows = []
+
+
+    embedding_blocks = []
+
+
+    # ========================================================
+    # CLIENTES
+    # ========================================================
+
+    for account, g in grouped_trx:
+
+        g = (
+
+            g
+
+            .sort_values(
+                "txn_date"
+            )
+
+            .reset_index(
+                drop=True
+            )
+        )
+
+
+        if (
+            len(g)
+            <
+            CFG.min_txn_history
+        ):
+
+            continue
+
+
+        # ----------------------------------------------------
+        # Todos los eventos o últimas N transacciones
+        # ----------------------------------------------------
+
+        if (
+            max_events_per_account
+            is None
+        ):
+
+            start_pos = (
+                CFG.min_txn_history
+                -
+                1
+            )
+
+        else:
+
+            start_pos = max(
+
+                CFG.min_txn_history
+                -
+                1,
+
+                len(g)
+                -
+                max_events_per_account
+            )
+
+
+        # ====================================================
+        # CADA TRANSACCIÓN
+        # ====================================================
+
+        for pos in range(
+            start_pos,
+            len(g)
+        ):
+
+            current_tx = (
+                g.iloc[
+                    pos
+                ]
+            )
+
+
+            event_asof = pd.Timestamp(
+                current_tx[
+                    "txn_date"
+                ]
+            )
+
+
+            # =================================================
+            # SECUENCIA HASTA ESTE EVENTO
+            # =================================================
+
+            hist = (
+
+                g.iloc[
+                    : pos + 1
+                ]
+
+                .tail(
+                    CFG.max_seq_len
+                )
+
+                .copy()
+            )
+
+
+            # =================================================
+            # RECENCIA RELATIVA A LA TRANSACCIÓN ACTUAL
+            # =================================================
+
+            hist[
+                "days_to_asof"
+            ] = (
+
+                (
+                    event_asof
+
+                    -
+
+                    hist[
+                        "txn_date"
+                    ]
+                )
+
+                .dt
+                .total_seconds()
+
+                /
+
+                86400.0
+            )
+
+
+            hist[
+                "days_to_asof"
+            ] = (
+
+                hist[
+                    "days_to_asof"
+                ]
+
+                .clip(
+                    lower=0
+                )
+
+                .astype(
+                    np.float32
+                )
+            )
+
+
+            # =================================================
+            # NUMÉRICAS
+            # =================================================
+
+            seq_num = (
+
+                hist[
+                    SEQ_NUM_COLS
+                ]
+
+                .to_numpy(
+                    dtype=np.float32
+                )
+            )
+
+
+            num_buffer.append(
+                seq_num
+            )
+
+
+            # =================================================
+            # CATEGÓRICAS
+            # =================================================
+
+            for col in CAT_SEQ_COLS:
+
+                ids = (
+
+                    hist[
+                        col
+                    ]
+
+                    .astype(str)
+
+                    .map(
+
+                        lambda x:
+
+                            vocabs[
+                                col
+                            ].get(
+
+                                x,
+
+                                vocabs[
+                                    col
+                                ][
+                                    "<UNK>"
+                                ]
+                            )
+                    )
+
+                    .to_numpy(
+                        dtype=np.int64
+                    )
+                )
+
+
+                cat_buffer[
+                    col
+                ].append(
+                    ids
+                )
+
+
+            # =================================================
+            # METADATA DEL EVENTO
+            # =================================================
+
+            metadata_rows.append({
+
+                "NUM_CUENTA":
+                    account,
+
+                "txn_number":
+                    pos + 1,
+
+                "txn_date":
+                    current_tx[
+                        "txn_date"
+                    ],
+
+                "auth_amt":
+                    current_tx.get(
+                        "auth_amt",
+                        np.nan
+                    ),
+
+                "giro":
+                    current_tx.get(
+                        "giro",
+                        None
+                    ),
+
+                "giro_r":
+                    current_tx.get(
+                        "giro_r",
+                        None
+                    ),
+
+                "merchant":
+                    current_tx.get(
+                        "merchant",
+                        None
+                    ),
+
+                "merchant_r":
+                    current_tx.get(
+                        "merchant_r",
+                        None
+                    ),
+
+                "city":
+                    current_tx.get(
+                        "city",
+                        None
+                    ),
+
+                "city_r":
+                    current_tx.get(
+                        "city_r",
+                        None
+                    ),
+
+                "sequence_length":
+                    len(hist)
+            })
+
+
+            # =================================================
+            # CHUNK
+            # =================================================
+
+            if (
+                len(
+                    num_buffer
+                )
+                >=
+                chunk_size
+            ):
+
+                emb_chunk = (
+                    embed_event_chunk(
+
+                        num_buffer,
+
+                        cat_buffer,
+
+                        model,
+
+                        device
+                    )
+                )
+
+
+                embedding_blocks.append(
+                    emb_chunk
+                )
+
+
+                num_buffer = []
+
+
+                cat_buffer = {
+
+                    col: []
+
+                    for col
+                    in CAT_SEQ_COLS
+                }
+
+
+    # ========================================================
+    # ÚLTIMO BLOQUE
+    # ========================================================
+
+    if len(
+        num_buffer
+    ) > 0:
+
+        emb_chunk = embed_event_chunk(
+
+            num_buffer,
+
+            cat_buffer,
+
+            model,
+
+            device
+        )
+
+
+        embedding_blocks.append(
+            emb_chunk
+        )
+
+
+    if len(
+        embedding_blocks
+    ) == 0:
+
+        raise ValueError(
+            "No se generaron estados transaccionales."
+        )
+
+
+    embeddings = np.concatenate(
+
+        embedding_blocks,
+
+        axis=0
+    )
+
+
+    metadata = pd.DataFrame(
+        metadata_rows
+    )
+
+
+    return (
+        embeddings,
+        metadata
+    )
+
+
+# ============================================================
+# ============================================================
+# PARTE G
+# ASIGNAR NUEVAS TRANSACCIONES A MAPA SANO
+# ============================================================
+# ============================================================
+
+
+def classify_new_transactions(
+
+    tx_embeddings,
+
+    tx_metadata,
+
+    reference_bank
+
+):
+
+    # ========================================================
+    # MISMO SCALER TRANSACCIONAL SANO
+    # ========================================================
+
+    Z = (
+
+        reference_bank[
+            "tx_scaler"
+        ]
+
+        .transform(
+            tx_embeddings
+        )
+
+        .astype(
+            np.float32
+        )
+    )
+
+
+    # ========================================================
+    # CLUSTER TRANSACCIONAL SANO MÁS CERCANO
+    # ========================================================
+
+    clusters = (
+
+        reference_bank[
+            "tx_kmeans"
+        ]
+
+        .predict(
+            Z
+        )
+    )
+
+
+    centers = (
+
+        reference_bank[
+            "tx_kmeans"
+        ]
+
+        .cluster_centers_[
+            clusters
+        ]
+    )
+
+
+    distances = np.linalg.norm(
+
+        Z
+        -
+        centers,
+
+        axis=1
+    )
+
+
+    result = (
+        tx_metadata.copy()
+    )
+
+
+    result[
+        "healthy_tx_cluster"
+    ] = clusters
+
+
+    result[
+        "distance_to_healthy_tx_centroid"
+    ] = distances
+
+
+    # ========================================================
+    # P95/P99
+    # ========================================================
+
+    stats = (
+
+        reference_bank[
+            "tx_stats"
+        ][
+            [
+                "tx_cluster",
+                "p95",
+                "p99"
+            ]
+        ]
+
+        .rename(
+            columns={
+
+                "tx_cluster":
+                    "healthy_tx_cluster",
+
+                "p95":
+                    "healthy_tx_distance_p95",
+
+                "p99":
+                    "healthy_tx_distance_p99"
+            }
+        )
+    )
+
+
+    result = result.merge(
+
+        stats,
+
+        on="healthy_tx_cluster",
+
+        how="left"
+    )
+
+
+    result[
+        "outside_healthy_tx_p95"
+    ] = (
+
+        result[
+            "distance_to_healthy_tx_centroid"
+        ]
+
+        >
+
+        result[
+            "healthy_tx_distance_p95"
+        ]
+    ).astype(int)
+
+
+    result[
+        "outside_healthy_tx_p99"
+    ] = (
+
+        result[
+            "distance_to_healthy_tx_centroid"
+        ]
+
+        >
+
+        result[
+            "healthy_tx_distance_p99"
+        ]
+    ).astype(int)
+
+
+    result[
+        "tx_distance_vs_p95"
+    ] = (
+
+        result[
+            "distance_to_healthy_tx_centroid"
+        ]
+
+        /
+
+        result[
+            "healthy_tx_distance_p95"
+        ]
+    )
+
+
+    return result
+
+
+# ============================================================
+# EJEMPLO:
+#
+# Proyectar las transacciones nuevas
+# ============================================================
+
+# new_tx_embeddings, new_tx_meta = (
+#
+#     project_new_transaction_states(
+#
+#         trx_new=
+#             trx_score_nueva,
+#
+#         model=
+#             model2,
+#
+#         vocabs=
+#             vocabs,
+#
+#         device=
+#             device,
+#
+#         max_events_per_account=
+#             None
+#     )
+# )
+#
+#
+# new_tx_projection = classify_new_transactions(
+#
+#     tx_embeddings=
+#         new_tx_embeddings,
+#
+#     tx_metadata=
+#         new_tx_meta,
+#
+#     reference_bank=
+#         reference_bank
+# )
+#
+#
+# print(
+#     new_tx_projection.tail(20)
+# )
+
+
+# ============================================================
+# ============================================================
+# PARTE H
+# TRANSACCIONES SANAS MÁS SIMILARES A UNA NUEVA
+# ============================================================
+# ============================================================
+
+
+def find_similar_healthy_transactions(
+
+    query_idx,
+
+    new_tx_embeddings,
+
+    new_tx_projection,
+
+    reference_bank,
+
+    k=10
+
+):
+
+    # --------------------------------------------------------
+    # Permitir query_idx = -1
+    # para última transacción.
+    # --------------------------------------------------------
+
+    if query_idx < 0:
+
+        query_idx = (
+
+            len(
+                new_tx_embeddings
+            )
+
+            +
+
+            query_idx
+        )
+
+
+    query = (
+
+        new_tx_embeddings[
+            query_idx
+        ]
+
+        .reshape(
+            1,
+            -1
+        )
+    )
+
+
+    n_neighbors = min(
+
+        k,
+
+        len(
+            reference_bank[
+                "tx_meta"
+            ]
+        )
+    )
+
+
+    distances, indices = (
+
+        reference_bank[
+            "nn_transactions"
+        ]
+
+        .kneighbors(
+
+            query,
+
+            n_neighbors=
+                n_neighbors
+        )
+    )
+
+
+    neighbors = (
+
+        reference_bank[
+            "tx_meta"
+        ]
+
+        .iloc[
+            indices[0]
+        ]
+
+        .copy()
+
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+    neighbors[
+        "cosine_distance"
+    ] = distances[0]
+
+
+    neighbors[
+        "similarity"
+    ] = (
+
+        1.0
+
+        -
+
+        distances[0]
+    )
+
+
+    query_info = (
+
+        new_tx_projection
+
+        .iloc[
+            [
+                query_idx
+            ]
+        ]
+
+        .copy()
+    )
+
+
+    return (
+        query_info,
+        neighbors
+    )
+
+
+# ============================================================
+# EJEMPLO:
+# ÚLTIMA TRANSACCIÓN DEL CLIENTE
+# ============================================================
+
+# query_tx, similares_tx = (
+#
+#     find_similar_healthy_transactions(
+#
+#         query_idx=-1,
+#
+#         new_tx_embeddings=
+#             new_tx_embeddings,
+#
+#         new_tx_projection=
+#             new_tx_projection,
+#
+#         reference_bank=
+#             reference_bank,
+#
+#         k=10
+#     )
+# )
+#
+#
+# print(
+#     "\nTRANSACCIÓN NUEVA:"
+# )
+#
+#
+# print(
+#     query_tx
+# )
+#
+#
+# print(
+#     "\nTRANSACCIONES SANAS MÁS PARECIDAS:"
+# )
+#
+#
+# print(
+#     similares_tx[
+#         [
+#             "NUM_CUENTA",
+#             "txn_date",
+#             "auth_amt",
+#             "giro",
+#             "merchant",
+#             "tx_cluster",
+#             "distance_to_tx_centroid",
+#             "similarity"
+#         ]
+#     ]
+# )
+
+
+# ============================================================
+# ============================================================
+# PARTE I
+# EJEMPLO OPERATIVO COMPLETO
+# ============================================================
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 1. BASE NUEVA
+#
+# Después de aplicar TODO el preprocessing original:
+#
+# cartera_score_nueva
+# trx_score_nueva
+# ------------------------------------------------------------
+
+
+# ------------------------------------------------------------
+# 2. PARA build_samples()
+#
+# Como todavía no conocemos t+3:
+# ------------------------------------------------------------
+
+# cartera_score_nueva[
+#     "target_dummy"
+# ] = 0
+
+
+# ------------------------------------------------------------
+# 3. BUILD SAMPLES
+# ------------------------------------------------------------
+
+# (
+#     X_num_new,
+#     X_cat_new,
+#     X_static_new,
+#     y_dummy_new,
+#     len_new,
+#     keys_new
+#
+# ) = build_samples(
+#
+#     cartera_score_nueva,
+#
+#     trx_score_nueva,
+#
+#     vocabs,
+#
+#     target_col=
+#         "target_dummy"
+# )
+
+
+# ------------------------------------------------------------
+# 4. PROYECCIÓN CLIENTE
+# ------------------------------------------------------------
+
+# new_account_embeddings, new_projection = (
+#
+#     project_new_accounts(
+#
+#         X_num_new=
+#             X_num_new,
+#
+#         X_cat_new=
+#             X_cat_new,
+#
+#         X_static_new=
+#             X_static_new,
+#
+#         len_new=
+#             len_new,
+#
+#         keys_new=
+#             keys_new,
+#
+#         model=
+#             model2,
+#
+#         reference_bank=
+#             reference_bank,
+#
+#         device=
+#             device
+#     )
+# )
+
+
+# ------------------------------------------------------------
+# 5. CLIENTES SANOS MÁS PARECIDOS
+# ------------------------------------------------------------
+
+# query_cliente, similares_cliente = (
+#
+#     find_similar_healthy_accounts(
+#
+#         query_idx=-1,
+#
+#         new_embeddings=
+#             new_account_embeddings,
+#
+#         new_projection=
+#             new_projection,
+#
+#         reference_bank=
+#             reference_bank,
+#
+#         k=10
+#     )
+# )
+
+
+# ------------------------------------------------------------
+# 6. PROYECCIÓN TRANSACCIÓN POR TRANSACCIÓN
+# ------------------------------------------------------------
+
+# new_tx_embeddings, new_tx_meta = (
+#
+#     project_new_transaction_states(
+#
+#         trx_new=
+#             trx_score_nueva,
+#
+#         model=
+#             model2,
+#
+#         vocabs=
+#             vocabs,
+#
+#         device=
+#             device
+#     )
+# )
+
+
+# ------------------------------------------------------------
+# 7. UBICAR CADA TRANSACCIÓN EN MAPA SANO
+# ------------------------------------------------------------
+
+# new_tx_projection = classify_new_transactions(
+#
+#     tx_embeddings=
+#         new_tx_embeddings,
+#
+#     tx_metadata=
+#         new_tx_meta,
+#
+#     reference_bank=
+#         reference_bank
+# )
+
+
+# ------------------------------------------------------------
+# 8. COMPARAR ÚLTIMA TRANSACCIÓN
+#    CONTRA HISTÓRICO SANO
+# ------------------------------------------------------------
+
+# query_tx, similares_tx = (
+#
+#     find_similar_healthy_transactions(
+#
+#         query_idx=-1,
+#
+#         new_tx_embeddings=
+#             new_tx_embeddings,
+#
+#         new_tx_projection=
+#             new_tx_projection,
+#
+#         reference_bank=
+#             reference_bank,
+#
+#         k=10
+#     )
+# )
+
+
+# ------------------------------------------------------------
+# 9. VER RESULTADOS
+# ------------------------------------------------------------
+
+# print(
+#     "\nPROYECCIÓN CLIENTE:"
+# )
+#
+# print(
+#     new_projection
+# )
+
+
+# print(
+#     "\nCLIENTES SANOS SIMILARES:"
+# )
+#
+# print(
+#     similares_cliente
+# )
+
+
+# print(
+#     "\nTRAYECTORIA TRANSACCIONAL:"
+# )
+#
+# print(
+#     new_tx_projection[
+#         [
+#             "NUM_CUENTA",
+#             "txn_number",
+#             "txn_date",
+#             "auth_amt",
+#             "merchant",
+#             "healthy_tx_cluster",
+#             "distance_to_healthy_tx_centroid",
+#             "outside_healthy_tx_p95",
+#             "tx_distance_vs_p95"
+#         ]
+#     ]
+# )
+
+
+# print(
+#     "\nTRANSACCIONES SANAS MÁS PARECIDAS:"
+# )
+#
+# print(
+#     similares_tx[
+#         [
+#             "NUM_CUENTA",
+#             "txn_date",
+#             "auth_amt",
+#             "giro",
+#             "merchant",
+#             "tx_cluster",
+#             "similarity"
+#         ]
+#     ]
+# )
